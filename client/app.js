@@ -131,7 +131,7 @@ function showWinnerDisplay(winner, loser) {
   }
   
   // Reset buttons
-  readyBtn.style.display = 'inline-block';
+  // Don't show ready button here - let playerStatus event control visibility
   bustBtn.style.display = 'none';
   passBtn.style.display = 'none';
   
@@ -312,6 +312,9 @@ function startGame(scene) {
     gameDiv.style.display = 'block';
     if (roomLabel) roomLabel.textContent = 'Main Game';
     
+    // Open video panel in a separate window by default
+    openVideoPanelWindow();
+
     // Initialize camera/microphone - browser will prompt for permissions
     initializeCamera();
 }
@@ -319,11 +322,38 @@ function startGame(scene) {
 /* ===============================
    VIDEO PANEL STATE
 ================================ */
-const playerFeeds = {}; // socketId -> { videoElement, controls, enabled }
+const playerFeeds = {}; // socketId -> { videoElement, controls, enabled, panel: 'active'|'waiting' }
 const playerNames = {}; // socketId -> playerName (local tracking)
 let feedsOrderedThisGame = false; // Track if feeds have been ordered for current game
 let cameraEnabled = true;
 let micEnabled = true;
+let videoPanelWindow = null;
+let videoPanelDocument = null;
+let activePlayers = []; // Track which socketIds are active players
+let waitingPlayers = []; // Track which socketIds are waiting
+
+function getVideoPanelDocument() {
+  return document;
+}
+
+function getVideoPanelWindow() {
+  return window;
+}
+
+function openVideoPanelWindow() {
+  // Panel stays in main window but is made draggable and resizable
+  // This avoids the cross-document video stream issue
+  const panel = document.getElementById('videoPanel');
+  const waitingPanel = document.getElementById('waitingPanel');
+  if (!panel || !waitingPanel) return;
+  
+  // Ensure panels are visible and positioned for dragging
+  panel.style.position = 'fixed';
+  panel.style.zIndex = '2000';
+  waitingPanel.style.zIndex = '1999';
+  
+  console.log('✅ Video panels ready to drag');
+}
 
 /* ===============================
    CAMERA / MICROPHONE INITIALIZATION
@@ -341,7 +371,8 @@ async function initializeCamera(enableCam = true, enableMic = true) {
         
         // Track own name and create own video feed in panel
         playerNames[mySocketId] = playerName;
-        createPlayerFeed(mySocketId, playerName, localStream, true);
+        const isOwnWaiting = waitingPlayers.includes(mySocketId);
+        createPlayerFeed(mySocketId, playerName, localStream, true, isOwnWaiting);
         
         // Apply own stats if they were received earlier
         if (myOwnStats) {
@@ -395,20 +426,26 @@ async function initializeCamera(enableCam = true, enableMic = true) {
 /* ===============================
    VIDEO PANEL FUNCTIONS
 ================================ */
-function createPlayerFeed(socketId, playerName, stream, isLocal = false) {
+function createPlayerFeed(socketId, playerName, stream, isLocal = false, isWaiting = false) {
     // Remove existing feed if it exists
     if (playerFeeds[socketId]) {
         playerFeeds[socketId].container.remove();
     }
     
-    const panelContent = document.getElementById('videoPanelContent');
+    // Determine which panel to add to
+    const panelId = isWaiting ? 'waitingPanelContent' : 'videoPanelContent';
+    const panelContent = document.getElementById(panelId);
+    if (!panelContent) {
+        console.error(`❌ Panel content not found: ${panelId}`);
+        return null;
+    }
     
-    // Create feed container
+    // Create feed container in main document
     const feedContainer = document.createElement('div');
     feedContainer.className = 'player-feed';
     feedContainer.id = `feed-${socketId}`;
     
-    // Video element
+    // Video element - MUST be in main document for WebRTC streams
     const video = document.createElement('video');
     video.autoplay = true;
     video.playsinline = true;
@@ -475,7 +512,8 @@ function createPlayerFeed(socketId, playerName, stream, isLocal = false) {
         cardsDiv,
         positionBadge,
         stream,
-        isLocal
+        isLocal,
+        panel: isWaiting ? 'waiting' : 'active'
     };
     
     return feedContainer;
@@ -553,10 +591,10 @@ function reorderFeedsByPlayOrder(playersArray) {
     const panelContent = document.getElementById('videoPanelContent');
     if (!panelContent || !playersArray || playersArray.length === 0) return;
     
-    // Update position badges and reorder
+    // Update position badges and reorder ONLY active players
     playersArray.forEach((player, index) => {
         const feed = playerFeeds[player.socketId];
-        if (feed) {
+        if (feed && feed.panel === 'active') {
             // Update position badge with ordinal suffix
             const ordinals = ['1st', '2nd', '3rd', '4th'];
             feed.positionBadge.textContent = ordinals[index];
@@ -570,41 +608,181 @@ function reorderFeedsByPlayOrder(playersArray) {
 /* ===============================
    DRAG AND RESIZE PANEL
 ================================ */
-function initializeVideoPanelDrag() {
-    const panel = document.getElementById('videoPanel');
-    const header = document.getElementById('videoPanelHeader');
-    
-    let isDragging = false;
-    let currentX, currentY, initialX, initialY;
-    
-    header.addEventListener('mousedown', (e) => {
-        isDragging = true;
-        initialX = e.clientX - panel.offsetLeft;
-        initialY = e.clientY - panel.offsetTop;
-        panel.style.cursor = 'grabbing';
-    });
-    
-    document.addEventListener('mousemove', (e) => {
-        if (!isDragging) return;
-        
-        e.preventDefault();
-        currentX = e.clientX - initialX;
-        currentY = e.clientY - initialY;
-        
-        panel.style.left = currentX + 'px';
-        panel.style.top = currentY + 'px';
+function initializeVideoPanelDrag(panelDoc = document, panelId = 'videoPanel', headerId = 'videoPanelHeader') {
+  const panel = panelDoc.getElementById(panelId);
+  const header = panelDoc.getElementById(headerId);
+
+  if (!panel || !header) return;
+
+  const view = panelDoc.defaultView || window;
+  const MIN_WIDTH = 260;
+  const MIN_HEIGHT = 240;
+  const getMaxBounds = () => {
+    const v = panelDoc.defaultView || window;
+    return {
+      maxWidth: Math.min(v.innerWidth * 0.95, 1400),
+      maxHeight: v.innerHeight - 20
+    };
+  };
+
+  // Ensure top is set so resizing from edges behaves consistently
+  const rect = panel.getBoundingClientRect();
+  panel.style.top = rect.top + 'px';
+  
+  // For waiting panel, ensure it's positioned from right; for main panel, from left
+  if (panel.classList.contains('waiting-panel')) {
+    panel.style.right = '20px';
+    panel.style.left = 'auto';
+  } else {
+    panel.style.left = rect.left + 'px';
+    panel.style.right = 'auto';
+  }
+
+  let isDragging = false;
+  let isResizing = false;
+  let resizeDir = '';
+  let dragStartX = 0;
+  let dragStartY = 0;
+  let startLeft = 0;
+  let startTop = 0;
+  let startWidth = 0;
+  let startHeight = 0;
+
+  const clamp = (val, min, max) => Math.max(min, Math.min(max, val));
+
+  const startDrag = (e) => {
+    isDragging = true;
+    dragStartX = e.clientX;
+    dragStartY = e.clientY;
+    const r = panel.getBoundingClientRect();
+    startLeft = r.left;
+    startTop = r.top;
+    panel.style.cursor = 'grabbing';
+  };
+
+  const startResize = (e, dir) => {
+    isResizing = true;
+    resizeDir = dir;
+    dragStartX = e.clientX;
+    dragStartY = e.clientY;
+    const r = panel.getBoundingClientRect();
+    startLeft = r.left;
+    startTop = r.top;
+    startWidth = r.width;
+    startHeight = r.height;
+    panel.style.maxHeight = 'none';
+    panel.style.maxWidth = 'none';
+    e.preventDefault();
+  };
+
+  const onMouseMove = (e) => {
+    if (isDragging) {
+      const dx = e.clientX - dragStartX;
+      const dy = e.clientY - dragStartY;
+      const newLeft = startLeft + dx;
+      const newTop = startTop + dy;
+
+      if (panel.classList.contains('waiting-panel')) {
+        // For waiting panel, position from right
+        const newRight = window.innerWidth - newLeft - panel.offsetWidth;
+        panel.style.right = Math.max(0, newRight) + 'px';
+        panel.style.left = 'auto';
+      } else {
+        // For main panel, position from left
+        panel.style.left = newLeft + 'px';
         panel.style.right = 'auto';
-    });
+      }
+      panel.style.top = newTop + 'px';
+      return;
+    }
+
+    if (!isResizing) return;
+
+    const dx = e.clientX - dragStartX;
+    const dy = e.clientY - dragStartY;
+
+    let newLeft = startLeft;
+    let newTop = startTop;
+    let newWidth = startWidth;
+    let newHeight = startHeight;
+
+    const { maxWidth, maxHeight } = getMaxBounds();
+
+    if (resizeDir.includes('e')) {
+      newWidth = clamp(startWidth + dx, MIN_WIDTH, maxWidth);
+    }
+    if (resizeDir.includes('s')) {
+      newHeight = clamp(startHeight + dy, MIN_HEIGHT, maxHeight);
+    }
+    if (resizeDir.includes('w')) {
+      const width = clamp(startWidth - dx, MIN_WIDTH, maxWidth);
+      newLeft = startLeft + (startWidth - width);
+      newWidth = width;
+    }
+    if (resizeDir.includes('n')) {
+      const height = clamp(startHeight - dy, MIN_HEIGHT, maxHeight);
+      newTop = startTop + (startHeight - height);
+      newHeight = height;
+    }
+
+    panel.style.top = newTop + 'px';
+    panel.style.width = newWidth + 'px';
+    panel.style.height = newHeight + 'px';
     
-    document.addEventListener('mouseup', () => {
-        isDragging = false;
-        panel.style.cursor = 'default';
+    if (panel.classList.contains('waiting-panel')) {
+      // For waiting panel, position from right
+      const newRight = window.innerWidth - newLeft - newWidth;
+      panel.style.right = Math.max(0, newRight) + 'px';
+      panel.style.left = 'auto';
+    } else {
+      // For main panel, position from left
+      panel.style.left = newLeft + 'px';
+      panel.style.right = 'auto';
+    }
+  };
+
+  const stopActions = () => {
+    isDragging = false;
+    isResizing = false;
+    resizeDir = '';
+    panel.style.cursor = 'default';
+  };
+
+  if (!header.dataset.dragBound) {
+    header.addEventListener('mousedown', (e) => startDrag(e));
+    header.dataset.dragBound = 'true';
+  }
+
+  panelDoc.addEventListener('mousemove', onMouseMove);
+  panelDoc.addEventListener('mouseup', stopActions);
+
+  // Add resize handles if not present
+  const dirs = ['n','s','e','w','ne','nw','se','sw'];
+  let handles = panel.querySelectorAll('.video-panel-resizer');
+  if (handles.length === 0) {
+    dirs.forEach((dir) => {
+      const handle = panelDoc.createElement('div');
+      handle.className = `video-panel-resizer ${dir}`;
+      panel.appendChild(handle);
     });
+    handles = panel.querySelectorAll('.video-panel-resizer');
+  }
+
+  handles.forEach((handle) => {
+    if (!handle.dataset.resizeBound) {
+      const dirClass = dirs.find(d => handle.classList.contains(d));
+      if (dirClass) {
+        handle.addEventListener('mousedown', (e) => startResize(e, dirClass));
+        handle.dataset.resizeBound = 'true';
+      }
+    }
+  });
 }
 
 // Initialize drag on page load
 window.addEventListener('DOMContentLoaded', () => {
-    initializeVideoPanelDrag();
+  initializeVideoPanelDrag(document, 'videoPanel', 'videoPanelHeader');
+  initializeVideoPanelDrag(document, 'waitingPanel', 'waitingPanelHeader');
 });
 
 /* ===============================
@@ -659,6 +837,7 @@ function displayRemoteStream(remoteSocketId, stream) {
     
     // Use locally tracked player name or placeholder
     const playerName = playerNames[remoteSocketId] || `Player ${remoteSocketId.substring(0, 4)}`;
+    const isWaiting = waitingPlayers.includes(remoteSocketId);
     
     // Check if feed already exists
     if (playerFeeds[remoteSocketId]) {
@@ -673,9 +852,9 @@ function displayRemoteStream(remoteSocketId, stream) {
         }
         console.log('Updated existing feed for', remoteSocketId, 'with name:', playerName);
     } else {
-        // Create new feed
-        console.log('Creating new feed for', remoteSocketId, 'with name:', playerName);
-        createPlayerFeed(remoteSocketId, playerName, stream, false);
+        // Create new feed in appropriate panel
+        console.log('Creating new feed for', remoteSocketId, 'with name:', playerName, '- waiting:', isWaiting);
+        createPlayerFeed(remoteSocketId, playerName, stream, false, isWaiting);
     }
     
     // Request stats for this player
@@ -1079,6 +1258,59 @@ function playTurnChime() {
 }
 
 /* ===============================
+   SORT CARDS FOR TABLE DISPLAY
+================================ */
+function sortCardsForDisplay(cards, handType) {
+  const RANK_ORDER = ['3','4','5','6','7','8','9','10','J','Q','K','A','2'];
+  const SUIT_RANK = { 'C': 1, 'S': 2, 'H': 3, 'D': 4 };
+  
+  // For straights and straight flushes, display in sequence order
+  if (handType === 'straight' || handType === 'straight_flush') {
+    // Check if this is a low straight (2-3-4-5-6 where 2 is low)
+    const ranks = cards.map(c => c.rank);
+    const hasLowStraight = ranks.includes('2') && ranks.includes('3') && 
+                          ranks.includes('4') && ranks.includes('5') && 
+                          ranks.includes('6');
+    
+    if (hasLowStraight) {
+      // Display as 2-3-4-5-6 (2 is low in this case)
+      const order = ['2', '3', '4', '5', '6'];
+      return cards.sort((a, b) => order.indexOf(a.rank) - order.indexOf(b.rank));
+    }
+    
+    // For normal straights, sort by rank value
+    return [...cards].sort((a, b) => {
+      const aVal = RANK_ORDER.indexOf(a.rank);
+      const bVal = RANK_ORDER.indexOf(b.rank);
+      return aVal - bVal;
+    });
+  }
+  
+  // For flushes, display highest cards first
+  if (handType === 'flush') {
+    return [...cards].sort((a, b) => {
+      const aVal = RANK_ORDER.indexOf(a.rank);
+      const bVal = RANK_ORDER.indexOf(b.rank);
+      return bVal - aVal; // highest first
+    });
+  }
+  
+  // For other hands (pairs, trips, etc), group by rank then by suit
+  return [...cards].sort((a, b) => {
+    const aRank = RANK_ORDER.indexOf(a.rank);
+    const bRank = RANK_ORDER.indexOf(b.rank);
+    
+    // Same rank: sort by suit
+    if (aRank === bRank) {
+      return SUIT_RANK[b.suit] - SUIT_RANK[a.suit];
+    }
+    
+    // Different ranks: group matching ranks together, highest first
+    return bRank - aRank;
+  });
+}
+
+/* ===============================
    UPDATE TABLE AREA
 ================================ */
 socket.on('updateTable', (table) => {
@@ -1105,7 +1337,10 @@ socket.on('updateTable', (table) => {
     handDiv.style.justifyContent = 'center';
     handDiv.style.alignItems = 'center';
 
-    play.cards.forEach((c) => {
+    // Sort cards appropriately based on hand type
+    const sortedCards = sortCardsForDisplay(play.cards, play.handType);
+
+    sortedCards.forEach((c) => {
       const cardDiv = document.createElement('div');
       cardDiv.classList.add('table-card');
 
@@ -1179,25 +1414,86 @@ socket.on('turnUpdate', ({ playerId, players, playerCount }) => {
     
     // Reorder feeds by play order only once per game (at game start)
     if (!feedsOrderedThisGame) {
+      // Move any waiting players back to active panel if they're now in the game
+      players.forEach(player => {
+        if (playerFeeds[player.socketId] && playerFeeds[player.socketId].panel === 'waiting') {
+          const feed = playerFeeds[player.socketId];
+          feed.container.remove();
+          const activeContent = document.getElementById('videoPanelContent');
+          if (activeContent) {
+            activeContent.appendChild(feed.container);
+            feed.panel = 'active';
+          }
+        }
+      });
+      
       reorderFeedsByPlayOrder(players);
       feedsOrderedThisGame = true;
     }
   }
 });
 
-// Waiting list handler: all players are already in side panel
+// Waiting list handler: move players to waiting room panel
 socket.on('waitingList', (waiting) => {
   console.log('📋 Received waitingList:', waiting);
   
-  // Track waiting players' names
+  waitingPlayers = [];
+  
+  // Track waiting players' names and update panel
   if (Array.isArray(waiting)) {
-    waiting.forEach(player => {
+    const waitingPanel = document.getElementById('waitingPanel');
+    const hasWaiting = waiting.length > 0;
+    
+    if (waitingPanel) {
+      waitingPanel.style.display = hasWaiting ? 'flex' : 'none';
+    }
+    
+    waiting.forEach(async (player) => {
       if (player && player.socketId && player.name) {
         playerNames[player.socketId] = player.name;
-        // Update feed name if it exists
-        updatePlayerFeedName(player.socketId, player.name);
+        waitingPlayers.push(player.socketId);
+        
+        // If player feed exists, move it to waiting room
+        if (playerFeeds[player.socketId]) {
+          const feed = playerFeeds[player.socketId];
+          // Move feed to waiting room if it's currently in active
+          if (feed.panel === 'active') {
+            feed.container.remove();
+            const waitingContent = document.getElementById('waitingPanelContent');
+            if (waitingContent) {
+              waitingContent.appendChild(feed.container);
+              feed.panel = 'waiting';
+              feed.positionBadge.textContent = ''; // Clear position badge for waiting room
+              feed.cardsDiv.textContent = ''; // Clear card count for waiting room
+            }
+          }
+          // Update feed name if it exists
+          updatePlayerFeedName(player.socketId, player.name);
+        } else {
+          // No feed exists for this waiting player - create peer connection if we don't have one
+          if (!peerConnections[player.socketId] && localStream) {
+            console.log('📞 Creating peer connection with waiting player:', player.socketId);
+            await createPeerConnectionAndOffer(player.socketId);
+          }
+        }
       }
     });
+  }
+});
+
+// Socket handler to track game start with active players
+socket.on('updatePlayers', (players) => {
+  console.log('📋 UpdatePlayers received:', players);
+  
+  // Update activePlayers array with currently active players
+  if (Array.isArray(players)) {
+    activePlayers = players.map(p => p.socketId || p).filter(id => id);
+    
+    // Hide waiting panel if no waiting players
+    const waitingPanel = document.getElementById('waitingPanel');
+    if (waitingPanel && waitingPlayers.length === 0) {
+      waitingPanel.style.display = 'none';
+    }
   }
 });
 
@@ -1205,10 +1501,12 @@ socket.on('waitingList', (waiting) => {
 socket.on('existingPlayers', async (players) => {
   console.log('📋 Existing players in room:', players);
   
-  // Track their names
+  // Track their names and mark as active
+  activePlayers = [];
   players.forEach(p => {
     if (p.socketId && p.name) {
       playerNames[p.socketId] = p.name;
+      activePlayers.push(p.socketId);
     }
   });
   
@@ -1231,6 +1529,7 @@ socket.on('newPlayerJoined', async (playerInfo) => {
   if (playerInfo && playerInfo.socketId && playerInfo.name) {
     // Track the new player's name
     playerNames[playerInfo.socketId] = playerInfo.name;
+    activePlayers.push(playerInfo.socketId); // Add to active players
     console.log('📝 Tracked new player name:', playerInfo.name, 'for socketId:', playerInfo.socketId);
     
     // Create peer connection with the new player if we have a local stream

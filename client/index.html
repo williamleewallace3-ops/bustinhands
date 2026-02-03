@@ -34,13 +34,24 @@
 
         <div id="tableArea"></div>
 
-        <!-- VIDEO SIDE PANEL (draggable/resizable) -->
+        <!-- VIDEO SIDE PANELS (draggable/resizable) -->
+        <!-- Active Players Panel -->
         <div id="videoPanel" class="video-panel">
             <div id="videoPanelHeader" class="video-panel-header">
                 Players
             </div>
             <div id="videoPanelContent" class="video-panel-content">
-                <!-- Player video feeds will be dynamically added here -->
+                <!-- Active player video feeds will be dynamically added here -->
+            </div>
+        </div>
+
+        <!-- Waiting Room Panel -->
+        <div id="waitingPanel" class="video-panel waiting-panel" style="display:none;">
+            <div id="waitingPanelHeader" class="video-panel-header">
+                Waiting Room
+            </div>
+            <div id="waitingPanelContent" class="video-panel-content">
+                <!-- Waiting room player video feeds will be dynamically added here -->
             </div>
         </div>
 

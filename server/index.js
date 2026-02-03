@@ -151,7 +151,22 @@ function evalHand(cards) {
 
   // Straight Flush
   if (isFlush && straightHigh !== null) {
-    return { ok:true, type:'straight_flush', cat:8, key:[straightHigh, tieSuit], tieSuit };
+    // For straight flushes, tie breaker should be the suit of the actual high card
+    let straightTieSuit = tieSuit;
+    
+    // Special case: if it's a low straight, use suit of 6
+    const set = new Set(cards.map(c => rankValue(c.rank)));
+    const isLowStraight = set.has(12) && set.has(0) && set.has(1) && set.has(2) && set.has(3);
+    if (isLowStraight) {
+      const sixCard = cards.find(c => c.rank === '6');
+      straightTieSuit = sixCard ? suitValue(sixCard.suit) : tieSuit;
+    } else {
+      // For normal straights, find the actual high card based on straightHigh value
+      const highRankCard = cards.find(c => rankValue(c.rank) === straightHigh);
+      straightTieSuit = highRankCard ? suitValue(highRankCard.suit) : tieSuit;
+    }
+    
+    return { ok:true, type:'straight_flush', cat:8, key:[straightHigh, straightTieSuit], tieSuit:straightTieSuit };
   }
 
   // Full House
@@ -168,7 +183,23 @@ function evalHand(cards) {
 
   // Straight
   if (straightHigh !== null) {
-    return { ok:true, type:'straight', cat:4, key:[straightHigh, tieSuit], tieSuit };
+    // For straights, tie breaker should be the suit of the actual high card
+    // For low straight (2-3-4-5-6), high card is 6, not 2
+    let straightTieSuit = tieSuit;
+    
+    // Special case: if it's a low straight, use suit of 6
+    const set = new Set(cards.map(c => rankValue(c.rank)));
+    const isLowStraight = set.has(12) && set.has(0) && set.has(1) && set.has(2) && set.has(3);
+    if (isLowStraight) {
+      const sixCard = cards.find(c => c.rank === '6');
+      straightTieSuit = sixCard ? suitValue(sixCard.suit) : tieSuit;
+    } else {
+      // For normal straights, find the actual high card based on straightHigh value
+      const highRankCard = cards.find(c => rankValue(c.rank) === straightHigh);
+      straightTieSuit = highRankCard ? suitValue(highRankCard.suit) : tieSuit;
+    }
+    
+    return { ok:true, type:'straight', cat:4, key:[straightHigh, straightTieSuit], tieSuit:straightTieSuit };
   }
 
   // Four of a Kind (Quads)
@@ -519,7 +550,7 @@ if (!firstPlayDone[roomId]) {
     if (wasFirstPlay) {
       io.to(roomId).emit('hideDiscard');
     }
-    tablePlays[roomId].push({ player: socket.playerName, cards: playedCards });
+    tablePlays[roomId].push({ player: socket.playerName, cards: playedCards, handType: e.type });
 
     // Broadcast updated table
     io.to(roomId).emit('updateTable', tablePlays[roomId]);
@@ -563,29 +594,30 @@ if (!firstPlayDone[roomId]) {
             bestHand: findBestHand(p.hand)
           }));
           
-          // Find the weakest best hand
-          let weakestPlayer = losersWithBestHands[0];
+          // Find the player with the WORST remaining hand (loser is eliminated)
+          let loserPlayer = losersWithBestHands[0];
           for (let i = 1; i < losersWithBestHands.length; i++) {
             const challenger = losersWithBestHands[i];
-            const weakestTypeRank = HAND_TYPE_RANK[weakestPlayer.bestHand.type] || 0;
+            const loserTypeRank = HAND_TYPE_RANK[loserPlayer.bestHand.type] || 0;
             const challengerTypeRank = HAND_TYPE_RANK[challenger.bestHand.type] || 0;
             
-            if (challengerTypeRank < weakestTypeRank) {
-              weakestPlayer = challenger;
-            } else if (challengerTypeRank === weakestTypeRank) {
+            // Lower hand type rank is worse (better for elimination)
+            if (challengerTypeRank < loserTypeRank) {
+              loserPlayer = challenger;
+            } else if (challengerTypeRank === loserTypeRank) {
               // Same hand type, compare rank
-              if (challenger.bestHand.rank < weakestPlayer.bestHand.rank) {
-                weakestPlayer = challenger;
-              } else if (challenger.bestHand.rank === weakestPlayer.bestHand.rank) {
-                // Same rank, compare suit (lower suit loses)
-                if (challenger.bestHand.suit < weakestPlayer.bestHand.suit) {
-                  weakestPlayer = challenger;
+              if (challenger.bestHand.rank < loserPlayer.bestHand.rank) {
+                loserPlayer = challenger;
+              } else if (challenger.bestHand.rank === loserPlayer.bestHand.rank) {
+                // Same rank, lower suit means they have the worse hand (loses)
+                if (challenger.bestHand.suit < loserPlayer.bestHand.suit) {
+                  loserPlayer = challenger;
                 }
               }
             }
           }
           
-          losers = [weakestPlayer];
+          losers = [loserPlayer];
         }
         
         const loser = losers[0];
@@ -611,8 +643,20 @@ if (!firstPlayDone[roomId]) {
           // Notify all players of status changes
           const nextPlayerSocket = rooms[roomId].find(p => p.socket.id === nextPlayerId);
           if (nextPlayerSocket) {
+            console.log(`📢 Sending active status to new player: ${nextPlayerSocket.name}`);
             io.to(nextPlayerId).emit('playerStatus', { status: 'active', queuePosition: 0 });
           }
+          
+          // Notify continuing players they're still active
+          console.log(`📢 Continuing players in game: ${inGame[roomId].length}`);
+          inGame[roomId].forEach(id => {
+            const playerName = rooms[roomId].find(p => p.socket.id === id)?.name || 'Unknown';
+            console.log(`📢 Checking player ${playerName} (${id}) vs nextPlayer ${nextPlayerId}`);
+            if (id !== nextPlayerId) {
+              console.log(`📢 Sending active status to continuing player: ${playerName}`);
+              io.to(id).emit('playerStatus', { status: 'active', queuePosition: 0 });
+            }
+          });
           
           if (loser.socket) {
             // Loser is now last in queue
