@@ -644,30 +644,34 @@ if (!firstPlayDone[roomId]) {
           // Add loser to back of waiting room
           waitingRoom[roomId].push(loser.id);
           
-          // Bring next person from waiting room to active game
-          const nextPlayerId = waitingRoom[roomId].shift();
-          inGame[roomId].push(nextPlayerId);
-          
-          // Notify all players of status changes
-          const nextPlayerSocket = rooms[roomId].find(p => p.socket.id === nextPlayerId);
-          if (nextPlayerSocket) {
-            console.log(`📢 Sending active status to new player: ${nextPlayerSocket.name}`);
-            io.to(nextPlayerId).emit('playerStatus', { status: 'active', queuePosition: 0 });
+          // Bring waiting players to active game until we have 4 or run out of waiting players
+          const newPlayersAdded = [];
+          while (inGame[roomId].length < 4 && waitingRoom[roomId].length > 0) {
+            const nextPlayerId = waitingRoom[roomId].shift();
+            inGame[roomId].push(nextPlayerId);
+            newPlayersAdded.push(nextPlayerId);
           }
           
-          // Notify continuing players they're still active
-          console.log(`📢 Continuing players in game: ${inGame[roomId].length}`);
-          inGame[roomId].forEach(id => {
-            const playerName = rooms[roomId].find(p => p.socket.id === id)?.name || 'Unknown';
-            console.log(`📢 Checking player ${playerName} (${id}) vs nextPlayer ${nextPlayerId}`);
-            if (id !== nextPlayerId) {
-              console.log(`📢 Sending active status to continuing player: ${playerName}`);
-              io.to(id).emit('playerStatus', { status: 'active', queuePosition: 0 });
+          // Notify newly promoted players they're now active
+          newPlayersAdded.forEach(nextPlayerId => {
+            const nextPlayerSocket = rooms[roomId].find(p => p.socket.id === nextPlayerId);
+            if (nextPlayerSocket) {
+              console.log(`📢 Sending active status to promoted player: ${nextPlayerSocket.name}`);
+              io.to(nextPlayerId).emit('playerStatus', { status: 'active', queuePosition: -1 });
             }
           });
           
+          // Notify continuing players they're still active
+          console.log(`📢 Continuing players in game: ${inGame[roomId].length}`);
+          const continuingPlayers = inGame[roomId].filter(id => !newPlayersAdded.includes(id));
+          continuingPlayers.forEach(id => {
+            const playerName = rooms[roomId].find(p => p.socket.id === id)?.name || 'Unknown';
+            console.log(`📢 Sending active status to continuing player: ${playerName}`);
+            io.to(id).emit('playerStatus', { status: 'active', queuePosition: -1 });
+          });
+          
           if (loser.socket) {
-            // Loser is now last in queue
+            // Loser is now in waiting queue
             io.to(loser.id).emit('playerStatus', { 
               status: 'waiting', 
               queuePosition: waitingRoom[roomId].length
