@@ -699,6 +699,13 @@ if (!firstPlayDone[roomId]) {
           winner: socket.playerName,
           loser: null
         });
+        
+        // Notify all continuing players they remain active
+        inGame[roomId].forEach(id => {
+          const playerName = rooms[roomId].find(p => p.socket.id === id)?.name || 'Unknown';
+          console.log(`📢 Sending active status to continuing player (no waiting room): ${playerName}`);
+          io.to(id).emit('playerStatus', { status: 'active', queuePosition: -1 });
+        });
       }
       
       // Reset game state for next round
