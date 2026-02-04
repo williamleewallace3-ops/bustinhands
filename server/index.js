@@ -397,14 +397,22 @@ io.on('connection', (socket) => {
     ready[roomId][socket.id] = false;
 
     // Automatically assign to active game or waiting room based on position
-    if (inGame[roomId].length < 4) {
-      // First 4 players join active game
+    // If game is already in progress, late joiners must wait until next game
+    if (started[roomId] === true) {
+      // Game in progress: all new players go to waiting room
+      waitingRoom[roomId].push(socket.id);
+      const queuePosition = waitingRoom[roomId].length;
+      console.log(`Player ${playerName} (${socket.id}) joined mid-game, added to waiting room queue. Position: ${queuePosition}`);
+      const stats = playerStats[playerName] || { wins: 0, gamesPlayed: 0 };
+      socket.emit('playerStatus', { status: 'waiting', queuePosition, stats });
+    } else if (inGame[roomId].length < 4) {
+      // Game not started and less than 4 players: join active game
       inGame[roomId].push(socket.id);
       console.log(`Player ${playerName} (${socket.id}) auto-joined active game. Count: ${inGame[roomId].length}`);
       const stats = playerStats[playerName] || { wins: 0, gamesPlayed: 0 };
       socket.emit('playerStatus', { status: 'active', queuePosition: -1, stats });
     } else {
-      // Players 5+ join waiting room queue
+      // Game not started but 4+ players: join waiting room queue
       waitingRoom[roomId].push(socket.id);
       const queuePosition = waitingRoom[roomId].length;
       console.log(`Player ${playerName} (${socket.id}) auto-joined waiting room queue. Position: ${queuePosition}`);
