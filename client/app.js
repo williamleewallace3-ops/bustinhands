@@ -179,14 +179,19 @@ function showRevealPrompt() {
 }
 
 function displayRevealedHand(socketId, playerName, cards) {
+  console.log(`Displaying revealed hand for ${playerName} (${socketId})`);
+  
   // Remove existing reveal for this player
   const existing = document.getElementById(`reveal-${socketId}`);
-  if (existing) existing.remove();
+  if (existing) {
+    console.log(`Removing existing reveal for ${playerName}`);
+    existing.remove();
+  }
   
   const revealContainer = document.createElement('div');
   revealContainer.id = `reveal-${socketId}`;
   revealContainer.className = 'revealed-hand';
-  revealContainer.style.cssText = 'background: rgba(0, 0, 0, 0.8); padding: 15px; border-radius: 10px; border: 2px solid #ffd700;';
+  revealContainer.style.cssText = 'background: rgba(0, 0, 0, 0.8); padding: 15px; border-radius: 10px; border: 2px solid #ffd700; margin-bottom: 10px; position: relative;';
   
   const label = document.createElement('div');
   label.textContent = `${playerName}'s remaining hand:`;
@@ -213,6 +218,7 @@ function displayRevealedHand(socketId, playerName, cards) {
   // Add to a container for all reveals
   let revealsContainer = document.getElementById('revealsContainer');
   if (!revealsContainer) {
+    console.log('Creating new revealsContainer');
     revealsContainer = document.createElement('div');
     revealsContainer.id = 'revealsContainer';
     revealsContainer.style.cssText = `
@@ -222,16 +228,21 @@ function displayRevealedHand(socketId, playerName, cards) {
       transform: translateX(-50%);
       display: flex;
       flex-direction: column;
+      align-items: center;
       gap: 15px;
       max-width: 90%;
-      max-height: 50vh;
+      max-height: 60vh;
       overflow-y: auto;
       z-index: 9999;
+      padding: 10px;
     `;
     document.body.appendChild(revealsContainer);
+  } else {
+    console.log(`Found existing revealsContainer with ${revealsContainer.children.length} children`);
   }
   
   revealsContainer.appendChild(revealContainer);
+  console.log(`Added reveal. Container now has ${revealsContainer.children.length} children`);
 }
 
 /* ===============================
