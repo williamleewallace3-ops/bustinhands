@@ -749,6 +749,13 @@ if (!firstPlayDone[roomId]) {
       players.forEach(p => {
         ready[roomId][p.socket.id] = false;
       });
+
+      // Ensure all active players receive active status (ready button)
+      (inGame[roomId] || []).forEach(id => {
+        const playerName = rooms[roomId].find(p => p.socket.id === id)?.name || 'Unknown';
+        console.log(`📢 Sending active status after reset: ${playerName}`);
+        io.to(id).emit('playerStatus', { status: 'active', queuePosition: -1 });
+      });
       
       return;
     }
