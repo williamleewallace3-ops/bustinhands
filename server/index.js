@@ -532,6 +532,10 @@ if (!firstPlayDone[roomId]) {
       }
 
       const cmp = compareEval(e, prevEval);
+      console.log(`🔍 Comparing hands:`);
+      console.log(`  Current play: ${JSON.stringify(e)}`);
+      console.log(`  Previous play: ${JSON.stringify(prevEval)}`);
+      console.log(`  Comparison result: ${cmp}`);
       if (cmp <= 0) {
         socket.emit('errorMessage', 'Your hand does not beat the previous hand.');
         return;
@@ -630,14 +634,17 @@ if (!firstPlayDone[roomId]) {
         
         const loser = losers[0];
         
-        // Emit game over with winner and loser
+        // Check if there's actually a waiting room with players
+        const hasWaitingRoom = waitingRoom[roomId] && waitingRoom[roomId].length > 0;
+        
+        // Emit game over with winner and loser (only show loser if waiting room exists)
         io.to(roomId).emit('gameOver', { 
           winner: socket.playerName,
-          loser: loser.socket ? loser.socket.name : 'Unknown'
+          loser: hasWaitingRoom ? (loser.socket ? loser.socket.name : 'Unknown') : null
         });
         
         // Move loser to back of waiting room queue (if waiting room exists)
-        if (waitingRoom[roomId] && waitingRoom[roomId].length > 0) {
+        if (hasWaitingRoom) {
           // If we have a 3-player game and waiting players, bring waiting players up to 4
           // without removing the "loser" from the 3-player game
           if (inGame[roomId].length === 3) {
