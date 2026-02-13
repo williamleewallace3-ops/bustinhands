@@ -63,14 +63,18 @@ socket.on('playAccepted', ({ playedCards }) => {
   );
 });
 
-socket.on('gameOver', ({ winner, loser }) => {
-  showWinnerDisplay(winner, loser);
+socket.on('gameOver', ({ winner, loser, mySocketId }) => {
+  showWinnerDisplay(winner, loser, mySocketId);
+});
+
+socket.on('handRevealed', ({ socketId, playerName, cards }) => {
+  displayRevealedHand(socketId, playerName, cards);
 });
 
 /* ===============================
    WINNER DISPLAY
 ================================ */
-function showWinnerDisplay(winner, loser) {
+function showWinnerDisplay(winner, loser, winnerSocketId) {
   // Create overlay
   const overlay = document.createElement('div');
   overlay.id = 'winnerOverlay';
@@ -103,6 +107,11 @@ function showWinnerDisplay(winner, loser) {
   // Trigger animation
   setTimeout(() => overlay.classList.add('active'), 10);
   
+  // Show reveal prompt for non-winners
+  if (mySocketId !== winnerSocketId && playerCards.length > 0) {
+    setTimeout(() => showRevealPrompt(), 1000);
+  }
+  
   // Reset game after 4 seconds
   setTimeout(() => {
     overlay.remove();
@@ -110,11 +119,122 @@ function showWinnerDisplay(winner, loser) {
   }, 4000);
 }
 
+function showRevealPrompt() {
+  const prompt = document.createElement('div');
+  prompt.id = 'revealPrompt';
+  prompt.style.cssText = `
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: rgba(0, 0, 0, 0.9);
+    padding: 30px;
+    border-radius: 15px;
+    border: 2px solid #ffd700;
+    z-index: 10001;
+    text-align: center;
+  `;
+  
+  const title = document.createElement('h2');
+  title.textContent = 'Reveal Hand?';
+  title.style.cssText = 'color: white; margin: 0 0 20px 0;';
+  
+  const btnContainer = document.createElement('div');
+  btnContainer.style.cssText = 'display: flex; gap: 15px; justify-content: center;';
+  
+  const yesBtn = document.createElement('button');
+  yesBtn.textContent = 'Yes';
+  yesBtn.style.cssText = `
+    padding: 10px 30px;
+    font-size: 18px;
+    background: #4CAF50;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+  `;
+  yesBtn.onclick = () => {
+    socket.emit('revealHand');
+    prompt.remove();
+  };
+  
+  const noBtn = document.createElement('button');
+  noBtn.textContent = 'No';
+  noBtn.style.cssText = `
+    padding: 10px 30px;
+    font-size: 18px;
+    background: #f44336;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+  `;
+  noBtn.onclick = () => prompt.remove();
+  
+  btnContainer.appendChild(yesBtn);
+  btnContainer.appendChild(noBtn);
+  prompt.appendChild(title);
+  prompt.appendChild(btnContainer);
+  document.body.appendChild(prompt);
+}
+
+function displayRevealedHand(socketId, playerName, cards) {
+  // Remove existing reveal for this player
+  const existing = document.getElementById(`reveal-${socketId}`);
+  if (existing) existing.remove();
+  
+  const revealContainer = document.createElement('div');
+  revealContainer.id = `reveal-${socketId}`;
+  revealContainer.className = 'revealed-hand';
+  
+  const label = document.createElement('div');
+  label.textContent = `${playerName}'s remaining hand:`;
+  label.style.cssText = 'color: white; font-weight: bold; margin-bottom: 10px; font-size: 16px;';
+  
+  const cardsDiv = document.createElement('div');
+  cardsDiv.style.cssText = 'display: flex; gap: 5px; flex-wrap: wrap;';
+  
+  cards.forEach(card => {
+    const cardEl = document.createElement('img');
+    cardEl.src = `/cards/${cardFileName(card)}`;
+    cardEl.style.cssText = 'width: 60px; height: 90px; border-radius: 5px;';
+    cardsDiv.appendChild(cardEl);
+  });
+  
+  revealContainer.appendChild(label);
+  revealContainer.appendChild(cardsDiv);
+  
+  // Add to a container for all reveals
+  let revealsContainer = document.getElementById('revealsContainer');
+  if (!revealsContainer) {
+    revealsContainer = document.createElement('div');
+    revealsContainer.id = 'revealsContainer';
+    revealsContainer.style.cssText = `
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      flex-direction: column;
+      gap: 15px;
+      max-width: 90%;
+      z-index: 9999;
+    `;
+    document.body.appendChild(revealsContainer);
+  }
+  
+  revealsContainer.appendChild(revealContainer);
+}
+
 /* ===============================
    RESET GAME
 ================================ */
   // Reset game state
   function resetGame() {
+  // Clear revealed hands
+  const revealsContainer = document.getElementById('revealsContainer');
+  if (revealsContainer) revealsContainer.remove();
+  
   // Clear player hand and table
   playerCards = [];
   playerHandDiv.innerHTML = '';

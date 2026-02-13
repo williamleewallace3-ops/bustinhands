@@ -53,6 +53,7 @@ const lastPlay = {};       // roomId -> { playerId, playerName, cards, eval } OR
 const passSet = {};        // roomId -> Set(socketId) that have passed since lastPlay
 const tablePlays = {};     // roomId -> [{ player, cards }] (since last clear)
 const discards = {};       // roomId -> card (3-player discard)
+const revealedHands = {};  // roomId -> { socketId: [cards] }
 
 /* ===============================
    CARD HELPERS
@@ -444,6 +445,22 @@ io.on('connection', (socket) => {
     socket.to(roomId).emit('newPlayerJoined', newPlayerInfo);
   });
 
+  socket.on('revealHand', () => {
+    const roomId = socket.roomId;
+    if (!roomId || !rooms[roomId]) return;
+
+    const hand = hands[roomId]?.[socket.id] || [];
+    if (!revealedHands[roomId]) revealedHands[roomId] = {};
+    revealedHands[roomId][socket.id] = hand;
+
+    // Broadcast to all players in room
+    io.to(roomId).emit('handRevealed', {
+      socketId: socket.id,
+      playerName: socket.playerName,
+      cards: hand
+    });
+  });
+
   socket.on('playerReady', () => {
     const roomId = socket.roomId;
     if (!roomId || !rooms[roomId]) return;
@@ -637,10 +654,14 @@ if (!firstPlayDone[roomId]) {
         // Check if there's actually a waiting room with players
         const hasWaitingRoom = waitingRoom[roomId] && waitingRoom[roomId].length > 0;
         
+        // Clear revealed hands from previous game
+        revealedHands[roomId] = {};
+        
         // Emit game over with winner and loser (only show loser if waiting room exists)
         io.to(roomId).emit('gameOver', { 
           winner: socket.playerName,
-          loser: hasWaitingRoom ? (loser.socket ? loser.socket.name : 'Unknown') : null
+          loser: hasWaitingRoom ? (loser.socket ? loser.socket.name : 'Unknown') : null,
+          mySocketId: socket.id
         });
         
         // Move loser to back of waiting room queue (if waiting room exists)
