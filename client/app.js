@@ -186,6 +186,7 @@ function displayRevealedHand(socketId, playerName, cards) {
   const revealContainer = document.createElement('div');
   revealContainer.id = `reveal-${socketId}`;
   revealContainer.className = 'revealed-hand';
+  revealContainer.style.cssText = 'background: rgba(0, 0, 0, 0.8); padding: 15px; border-radius: 10px; border: 2px solid #ffd700;';
   
   const label = document.createElement('div');
   label.textContent = `${playerName}'s remaining hand:`;
@@ -195,10 +196,15 @@ function displayRevealedHand(socketId, playerName, cards) {
   cardsDiv.style.cssText = 'display: flex; gap: 5px; flex-wrap: wrap;';
   
   cards.forEach(card => {
+    const cardWrapper = document.createElement('div');
+    cardWrapper.style.cssText = 'width: 60px; height: 90px; border-radius: 5px; background: white; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 8px rgba(0,0,0,0.3);';
+    
     const cardEl = document.createElement('img');
     cardEl.src = `/cards/${cardFileName(card)}`;
-    cardEl.style.cssText = 'width: 60px; height: 90px; border-radius: 5px;';
-    cardsDiv.appendChild(cardEl);
+    cardEl.style.cssText = 'width: 100%; height: 100%; object-fit: contain; border-radius: 5px;';
+    
+    cardWrapper.appendChild(cardEl);
+    cardsDiv.appendChild(cardWrapper);
   });
   
   revealContainer.appendChild(label);
@@ -211,13 +217,15 @@ function displayRevealedHand(socketId, playerName, cards) {
     revealsContainer.id = 'revealsContainer';
     revealsContainer.style.cssText = `
       position: fixed;
-      bottom: 20px;
+      top: 100px;
       left: 50%;
       transform: translateX(-50%);
       display: flex;
       flex-direction: column;
       gap: 15px;
       max-width: 90%;
+      max-height: 50vh;
+      overflow-y: auto;
       z-index: 9999;
     `;
     document.body.appendChild(revealsContainer);
