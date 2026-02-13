@@ -316,6 +316,7 @@ let playerName, roomId, playerCards = [];
 let draggingEl = null;
 let placeholder = null;
 let selectedScene = 'vampire-bar'; // default scene
+let selectedDeck = '1'; // default deck
 
 /* ===============================
    WEBRTC & VIDEO STATE
@@ -382,12 +383,12 @@ const highRollerBtn = document.getElementById('highRollerBtn');
 
 vampireBarBtn.addEventListener('click', () => {
     selectedScene = 'vampire-bar';
-    startGame('vampire-bar');
+    showDeckSelection();
 });
 
 highRollerBtn.addEventListener('click', () => {
     selectedScene = 'high-roller';
-    startGame('high-roller');
+    showDeckSelection();
 });
 
 const beachPartyBtn = document.getElementById('beachPartyBtn');
@@ -396,17 +397,32 @@ const tailgateBtn = document.getElementById('tailgateBtn');
 
 beachPartyBtn.addEventListener('click', () => {
   selectedScene = 'beach-party';
-  startGame('beach-party');
+  showDeckSelection();
 });
 
 templeBtn.addEventListener('click', () => {
   selectedScene = 'japanese-temple';
-  startGame('japanese-temple');
+  showDeckSelection();
 });
 
 tailgateBtn.addEventListener('click', () => {
   selectedScene = 'gsu-tailgate';
-  startGame('gsu-tailgate');
+  showDeckSelection();
+});
+
+function showDeckSelection() {
+  document.getElementById('sceneOverlay').style.display = 'none';
+  document.getElementById('deckOverlay').style.display = 'flex';
+}
+
+// Handle deck selection
+const deckButtons = document.querySelectorAll('.deckBtn');
+deckButtons.forEach(btn => {
+  btn.addEventListener('click', () => {
+    const deckNumber = btn.getAttribute('data-deck');
+    selectedDeck = deckNumber;
+    startGame(selectedScene);
+  });
 });
 
 function startGame(scene) {
@@ -1098,7 +1114,7 @@ function animateDealHand(cards) {
 
         // Face-down card
         const img = document.createElement('img');
-        img.src = '/cards/card_back.png';
+        img.src = `/cards/card_back${selectedDeck === '2' ? '2' : ''}.png`;
         img.classList.add('card-image');
         div.appendChild(img);
 

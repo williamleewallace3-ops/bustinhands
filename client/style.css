@@ -654,6 +654,84 @@ body {
 .sceneBtn:active {
     transform: scale(0.98);
 }
+
+/* ================================
+   DECK SELECTION SCREEN
+================================ */
+#deckOverlay {
+    position: fixed;
+    inset: 0;
+    z-index: 4999;
+    background-image: url('/images/lobby_background.png');
+    background-size: cover;
+    background-position: center 10%;
+    background-repeat: no-repeat;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+#deckContainer {
+    background: rgba(0, 0, 0, 0.85);
+    padding: 50px;
+    border-radius: 20px;
+    text-align: center;
+}
+
+#deckContainer h2 {
+    font-size: 36px;
+    color: white;
+    margin: 0 0 30px 0;
+    font-weight: 700;
+}
+
+#deckOptions {
+    display: flex;
+    gap: 40px;
+    justify-content: center;
+    align-items: center;
+}
+
+.deck-option {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 20px;
+}
+
+.deck-option img {
+    width: 180px;
+    height: 270px;
+    border-radius: 12px;
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+    transition: transform 0.3s ease;
+}
+
+.deck-option:hover img {
+    transform: scale(1.05);
+}
+
+.deckBtn {
+    padding: 15px 30px;
+    font-size: 20px;
+    font-weight: 700;
+    border-radius: 12px;
+    border: none;
+    background-color: #1f7a3d;
+    color: white;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
+
+.deckBtn:hover {
+    background-color: #145c2e;
+    box-shadow: 0 6px 20px rgba(31, 122, 61, 0.4);
+}
+
+.deckBtn:active {
+    transform: scale(0.98);
+}
+
 /* ================================
    TURN INDICATOR
 ================================ */
