@@ -75,6 +75,30 @@ function removeCardsFromHand(hand, cardsToRemove) {
   return hand.filter(c => !remove.has(cardKey(c)));
 }
 
+function isAutoPassHand(cards, evalResult) {
+  if (!evalResult || !evalResult.ok) return false;
+
+  const hasTwoDiamonds = hasCard(cards, '2', 'D');
+
+  if (evalResult.type === 'single') {
+    return cards.length === 1 && hasTwoDiamonds;
+  }
+
+  if (evalResult.type === 'pair' || evalResult.type === 'trips') {
+    const allTwos = cards.every(c => c.rank === '2');
+    return allTwos && hasTwoDiamonds;
+  }
+
+  if (evalResult.type === 'straight_flush') {
+    // Only auto-pass for J-Q-K-A-2 of diamonds (2 high straight flush)
+    const straightHigh = evalResult.key?.[0];
+    const allDiamonds = cards.every(c => c.suit === 'D');
+    return straightHigh === 12 && allDiamonds && hasTwoDiamonds;
+  }
+
+  return false;
+}
+
 function sameCards(a, b) {
   if (a.length !== b.length) return false;
   const sa = new Set(a.map(cardKey));
@@ -787,6 +811,21 @@ if (!firstPlayDone[roomId]) {
         io.to(id).emit('playerStatus', { status: 'active', queuePosition: -1 });
       });
       
+      return;
+    }
+
+    // Auto-pass for unbeatable 2♦ hands (single/pair/trips or J-Q-K-A-2♦ straight flush)
+    if (isAutoPassHand(playedCards, e)) {
+      // Clear trick
+      lastPlay[roomId] = null;
+      passSet[roomId] = new Set();
+      tablePlays[roomId] = [];
+
+      io.to(roomId).emit('updateTable', []); // clear UI table
+
+      // Turn goes back to the player who played the 2♦ hand
+      currentTurn[roomId] = socket.id;
+      emitTurn(roomId);
       return;
     }
 
