@@ -178,8 +178,10 @@ function evalHand(cards) {
 
   // Flush
   if (isFlush) {
-    const rkey = sortCardsHighFirst(cards).map(c => rankValue(c.rank));
-    return { ok:true, type:'flush', cat:5, key:[...rkey, tieSuit], tieSuit };
+    const highCard = sortCardsHighFirst(cards)[0];
+    const highRank = rankValue(highCard.rank);
+    const highSuit = suitValue(highCard.suit);
+    return { ok:true, type:'flush', cat:5, key:[highRank, highSuit], tieSuit: highSuit };
   }
 
   // Straight
