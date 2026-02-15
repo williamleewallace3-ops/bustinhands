@@ -204,7 +204,8 @@ function displayRevealedHand(socketId, playerName, cards) {
   const cardsDiv = document.createElement('div');
   cardsDiv.style.cssText = 'display: flex; gap: 5px; flex-wrap: wrap;';
   
-  cards.forEach(card => {
+  const sortedCards = sortCards([...cards]);
+  sortedCards.forEach(card => {
     const cardWrapper = document.createElement('div');
     cardWrapper.style.cssText = 'width: 60px; height: 90px; border-radius: 5px; background: white; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 8px rgba(0,0,0,0.3);';
     
