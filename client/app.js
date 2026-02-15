@@ -112,10 +112,9 @@ function showWinnerDisplay(winner, loser, winnerSocketId) {
     setTimeout(() => showRevealPrompt(), 1000);
   }
   
-  // Reset game after 4 seconds
+  // Remove winner overlay after 4 seconds (keep reveals until next deal)
   setTimeout(() => {
     overlay.remove();
-    resetGame();
   }, 4000);
 }
 
@@ -1250,8 +1249,9 @@ function dropHandler(e) {
    RECEIVE INITIAL HAND
 ================================ */
 socket.on('dealHand', cards => {
-    const sorted = sortCards(cards);
-    animateDealHand(sorted);
+  resetGame();
+  const sorted = sortCards(cards);
+  animateDealHand(sorted);
 });
 
 /* ===============================
