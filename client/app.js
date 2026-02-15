@@ -80,6 +80,13 @@ socket.on('clearReveals', () => {
    WINNER DISPLAY
 ================================ */
 function showWinnerDisplay(winner, loser, winnerSocketId) {
+  // Hide action buttons at game end
+  bustBtn.style.display = 'none';
+  passBtn.style.display = 'none';
+  if (turnIndicator) {
+    turnIndicator.style.display = 'none';
+  }
+
   // Create overlay
   const overlay = document.createElement('div');
   overlay.id = 'winnerOverlay';
