@@ -71,6 +71,11 @@ socket.on('handRevealed', ({ socketId, playerName, cards }) => {
   displayRevealedHand(socketId, playerName, cards);
 });
 
+socket.on('clearReveals', () => {
+  const revealsContainer = document.getElementById('revealsContainer');
+  if (revealsContainer) revealsContainer.remove();
+});
+
 /* ===============================
    WINNER DISPLAY
 ================================ */

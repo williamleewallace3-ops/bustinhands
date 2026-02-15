@@ -337,6 +337,9 @@ function emitTurn(roomId) {
 function startGame(roomId) {
   started[roomId] = true;
 
+  // Clear revealed hands for everyone as the next game starts
+  io.to(roomId).emit('clearReveals');
+
   tablePlays[roomId] = [];
   lastPlay[roomId] = null;
   passSet[roomId] = new Set();
