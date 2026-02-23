@@ -1091,10 +1091,13 @@ async function createPeerConnection(remoteSocketId) {
     };
     peerConnection.onicecandidate = (event) => {
         if (event.candidate) {
+            console.log('📤 Sending ICE candidate to', remoteSocketId, ':', event.candidate.candidate.substring(0, 50) + '...');
             socket.emit('ice-candidate', {
                 to: remoteSocketId,
                 candidate: event.candidate
             });
+        } else {
+            console.log('✅ ICE gathering complete for', remoteSocketId);
         }
     };
     
