@@ -431,8 +431,20 @@ let activePlayer = null; // socketId of player whose turn it is
 const ICE_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' }
-  ]
+    { urls: 'stun:stun1.l.google.com:19302' },
+    // TURN servers for NAT traversal fallback
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
+  ],
+  iceCandidatePoolSize: 10
 };
 
 const SCENE_BACKGROUNDS = {
@@ -1084,10 +1096,29 @@ async function createPeerConnection(remoteSocketId) {
     // Handle connection state changes
     peerConnection.onconnectionstatechange = () => {
         console.log('Connection state for', remoteSocketId, ':', peerConnection.connectionState);
+        if (peerConnection.connectionState === 'failed') {
+            console.log('⚠️ Connection failed for', remoteSocketId, '- attempting ICE restart');
+            // Attempt to restart ICE by creating a new offer with iceRestart
+            if (localStream) {
+                peerConnection.createOffer({ iceRestart: true })
+                    .then(offer => peerConnection.setLocalDescription(offer))
+                    .then(() => {
+                        socket.emit('offer', {
+                            to: remoteSocketId,
+                            offer: peerConnection.localDescription
+                        });
+                        console.log('📤 Sent ICE restart offer to', remoteSocketId);
+                    })
+                    .catch(err => console.error('❌ ICE restart failed:', err));
+            }
+        }
     };
     
     peerConnection.oniceconnectionstatechange = () => {
         console.log('ICE connection state for', remoteSocketId, ':', peerConnection.iceConnectionState);
+        if (peerConnection.iceConnectionState === 'failed') {
+            console.log('⚠️ ICE connection failed for', remoteSocketId);
+        }
     };
     peerConnection.onicecandidate = (event) => {
         if (event.candidate) {
