@@ -1917,7 +1917,7 @@ socket.on('offer', async ({ from, offer }) => {
       await pc.setLocalDescription({ type: 'rollback' });
     }
     
-    await pc.setRemoteDescription(new RTCSessionDescription(offer));
+    await pc.setRemoteDescription(offer);
     
     // Process any queued ICE candidates
     if (pc.pendingIceCandidates && pc.pendingIceCandidates.length > 0) {
@@ -1949,7 +1949,7 @@ socket.on('answer', async ({ from, answer }) => {
     const pc = peerConnections[from];
     if (pc) {
       if (pc.signalingState === 'have-local-offer') {
-        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        await pc.setRemoteDescription(answer);
         console.log('✅ Remote description set for', from);
         
         // Process any queued ICE candidates
