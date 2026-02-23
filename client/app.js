@@ -656,10 +656,21 @@ async function initializeCamera(enableCam = true, enableMic = true) {
         }
         
         // Create peer connections with players who joined before camera was ready
+        // Always attempt to create connections for all known players
         const existingPlayerIds = Object.keys(playerNames).filter(id => id !== mySocketId);
         for (const playerId of existingPlayerIds) {
             if (!peerConnections[playerId]) {
-                await createPeerConnectionAndOffer(playerId);
+                console.log('📞 Creating peer connection after camera init:', playerId);
+                // Always create connection now that we have localStream, ignore socketId comparison
+                try {
+                    const pc = await createPeerConnection(playerId);
+                    console.log('📞 Creating offer after camera init for', playerId);
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    socket.emit('offer', { to: playerId, offer });
+                } catch (err) {
+                    console.error('❌ Error creating connection after camera init:', err);
+                }
             }
         }
         
@@ -1897,33 +1908,72 @@ async function createPeerConnectionAndOffer(remoteSocketId) {
 ================================ */
 socket.on('offer', async ({ from, offer }) => {
   try {
-    console.log('Received offer from', from);
+    console.log('📨 Received offer from', from);
     const pc = await createPeerConnection(from);
+    
+    // Handle offer collision (glare) - if we're in have-local-offer state, use rollback
+    if (pc.signalingState === 'have-local-offer') {
+      console.log('⚠️ Offer collision detected with', from, '- rolling back');
+      await pc.setLocalDescription({ type: 'rollback' });
+    }
+    
     await pc.setRemoteDescription(new RTCSessionDescription(offer));
     
-    console.log('Creating answer for', from);
+    // Process any queued ICE candidates
+    if (pc.pendingIceCandidates && pc.pendingIceCandidates.length > 0) {
+      console.log('📥 Processing', pc.pendingIceCandidates.length, 'queued ICE candidates for', from);
+      for (const candidate of pc.pendingIceCandidates) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          console.error('❌ Error adding queued ICE candidate:', err);
+        }
+      }
+      pc.pendingIceCandidates = [];
+    }
+    
+    console.log('📝 Creating answer for', from);
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     
-    console.log('Sending answer to', from);
+    console.log('📤 Sending answer to', from);
     socket.emit('answer', { to: from, answer });
   } catch (err) {
-    console.error('❌ Error handling offer:', err);
+    console.error('❌ Error handling offer from', from, ':', err);
   }
 });
 
 socket.on('answer', async ({ from, answer }) => {
   try {
-    console.log('Received answer from', from);
+    console.log('📨 Received answer from', from);
     const pc = peerConnections[from];
     if (pc) {
-      await pc.setRemoteDescription(new RTCSessionDescription(answer));
-      console.log('✅ Remote description set for', from);
+      if (pc.signalingState === 'have-local-offer') {
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        console.log('✅ Remote description set for', from);
+        
+        // Process any queued ICE candidates
+        if (pc.pendingIceCandidates && pc.pendingIceCandidates.length > 0) {
+          console.log('📥 Processing', pc.pendingIceCandidates.length, 'queued ICE candidates for', from);
+          for (const candidate of pc.pendingIceCandidates) {
+            try {
+              await pc.addIceCandidate(new RTCIceCandidate(candidate));
+            } catch (err) {
+              console.error('❌ Error adding queued ICE candidate:', err);
+            }
+          }
+          pc.pendingIceCandidates = [];
+        }
+      } else {
+        console.warn('⚠️ Unexpected signaling state for', from, ':', pc.signalingState);
+      }
     } else {
-      console.warn('⚠️ No peer connection for', from);
+      console.warn('⚠️ No peer connection found for', from, '- creating one');
+      // Create peer connection if it doesn't exist (shouldn't happen normally)
+      await createPeerConnection(from);
     }
   } catch (err) {
-    console.error('❌ Error handling answer:', err);
+    console.error('❌ Error handling answer from', from, ':', err);
   }
 });
 
@@ -1931,10 +1981,23 @@ socket.on('ice-candidate', async ({ from, candidate }) => {
   try {
     const pc = peerConnections[from];
     if (pc && candidate) {
-      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      // Check if remote description is set before adding ICE candidate
+      if (pc.remoteDescription && pc.remoteDescription.type) {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        console.log('✅ Added ICE candidate from', from);
+      } else {
+        console.log('⏳ Queuing ICE candidate from', from, '(remote description not set yet)');
+        // Queue the candidate to be added after remote description is set
+        if (!pc.pendingIceCandidates) {
+          pc.pendingIceCandidates = [];
+        }
+        pc.pendingIceCandidates.push(candidate);
+      }
+    } else if (!pc) {
+      console.warn('⚠️ Received ICE candidate from', from, 'but no peer connection exists');
     }
   } catch (err) {
-    console.error('Error adding ICE candidate:', err);
+    console.error('❌ Error adding ICE candidate from', from, ':', err);
   }
 });
 
