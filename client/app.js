@@ -656,30 +656,22 @@ async function initializeCamera(enableCam = true, enableMic = true) {
         }
         
         // Create peer connections with players who joined before camera was ready
-        // Always attempt to create connections for all known players
+        // Use the same socketId comparison logic as existingPlayers/newPlayerJoined handlers
         const existingPlayerIds = Object.keys(playerNames).filter(id => id !== mySocketId);
         for (const playerId of existingPlayerIds) {
             if (!peerConnections[playerId]) {
                 console.log('📞 Creating peer connection after camera init:', playerId);
-                // Always create connection now that we have localStream, ignore socketId comparison
-                try {
-                    const pc = await createPeerConnection(playerId);
-                    console.log('📞 Creating offer after camera init for', playerId);
-                    const offer = await pc.createOffer();
-                    await pc.setLocalDescription(offer);
-                    socket.emit('offer', { to: playerId, offer });
-                } catch (err) {
-                    console.error('❌ Error creating connection after camera init:', err);
-                }
+                // Use socketId comparison to decide who creates offer (avoid glare)
+                await createPeerConnectionAndOffer(playerId);
             }
         }
         
-        // Add tracks to ALL existing peer connections and renegotiate if needed
+        // Add tracks to ALL existing peer connections if they don't have them
         for (const socketId of Object.keys(peerConnections)) {
             const pc = peerConnections[socketId];
-            const senders = pc.getSenders();
+            if (!pc) continue;
             
-            // Check if we have any senders with actual tracks
+            const senders = pc.getSenders();
             const hasActiveTracks = senders.some(sender => sender.track !== null);
             
             if (!hasActiveTracks && localStream) {
@@ -690,16 +682,6 @@ async function initializeCamera(enableCam = true, enableMic = true) {
                     pc.addTrack(track, localStream);
                     console.log('  Added', track.kind, 'track');
                 });
-                
-                // Renegotiate - create new offer regardless of who initiated originally
-                try {
-                    console.log('🔄 Renegotiating with', socketId, 'after adding tracks');
-                    const offer = await pc.createOffer();
-                    await pc.setLocalDescription(offer);
-                    socket.emit('offer', { to: socketId, offer });
-                } catch (err) {
-                    console.error('❌ Error renegotiating:', err);
-                }
             } else if (hasActiveTracks) {
                 console.log('✅ Peer connection', socketId, 'already has active tracks');
             }
