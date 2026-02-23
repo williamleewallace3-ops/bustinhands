@@ -819,6 +819,12 @@ if (!firstPlayDone[roomId]) {
 
     // Auto-pass for unbeatable 2♦ hands (single/pair/trips or J-Q-K-A-2♦ straight flush)
     if (isAutoPassHand(playedCards, e)) {
+      io.to(roomId).emit('powerTaken', {
+        playerId: socket.id,
+        playerName: socket.playerName || 'A player',
+        card: { rank: '2', suit: 'D' }
+      });
+
       // Clear trick
       lastPlay[roomId] = null;
       passSet[roomId] = new Set();

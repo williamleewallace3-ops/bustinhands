@@ -30,6 +30,8 @@ socket.on('playerStatus', ({ status, queuePosition, stats }) => {
   } else if (status === 'waiting') {
     readyBtn.style.display = 'none';
   }
+
+  updateInGameHeaderVisibility();
   
   // Store stats and update feed if it exists
   if (stats) {
@@ -75,6 +77,47 @@ socket.on('clearReveals', () => {
   const revealsContainer = document.getElementById('revealsContainer');
   if (revealsContainer) revealsContainer.remove();
 });
+
+let powerTakenTimeout = null;
+
+socket.on('powerTaken', ({ playerId, playerName, card }) => {
+  hasPowerLead = Boolean(mySocketId && playerId === mySocketId);
+  showPowerTakenBanner(playerName, card || { rank: '2', suit: 'D' });
+});
+
+function showPowerTakenBanner(playerName, card) {
+  const existing = document.getElementById('powerTakenBanner');
+  if (existing) existing.remove();
+  if (powerTakenTimeout) {
+    clearTimeout(powerTakenTimeout);
+    powerTakenTimeout = null;
+  }
+
+  const banner = document.createElement('div');
+  banner.id = 'powerTakenBanner';
+  banner.className = 'power-taken-banner';
+
+  const message = document.createElement('div');
+  message.className = 'power-taken-message';
+  message.textContent = `${playerName || 'A player'} has taken power`;
+
+  const cardImage = document.createElement('img');
+  cardImage.className = 'power-taken-card';
+  cardImage.src = `/cards/${cardFileName(card)}`;
+  cardImage.alt = '2 of diamonds';
+
+  banner.appendChild(message);
+  banner.appendChild(cardImage);
+  document.body.appendChild(banner);
+
+  requestAnimationFrame(() => banner.classList.add('visible'));
+
+  powerTakenTimeout = setTimeout(() => {
+    banner.classList.remove('visible');
+    setTimeout(() => banner.remove(), 220);
+    powerTakenTimeout = null;
+  }, 3000);
+}
 
 /* ===============================
    WINNER DISPLAY
@@ -280,6 +323,15 @@ function displayRevealedHand(socketId, playerName, cards) {
   if (discardDiv) {
     discardDiv.style.display = 'none';
   }
+
+  const powerBanner = document.getElementById('powerTakenBanner');
+  if (powerBanner) {
+    powerBanner.remove();
+  }
+  if (powerTakenTimeout) {
+    clearTimeout(powerTakenTimeout);
+    powerTakenTimeout = null;
+  }
   
   // Reset buttons
   // Don't show ready button here - let playerStatus event control visibility
@@ -293,6 +345,9 @@ function displayRevealedHand(socketId, playerName, cards) {
   
   // Reset turn state
   lastTurnPlayerId = null;
+  isMyTurn = false;
+  currentTrickCardCount = null;
+  hasPowerLead = false;
   
   // Reset feed order flag so they can be reordered for next game
   feedsOrderedThisGame = false;
@@ -317,6 +372,17 @@ const tableArea = document.getElementById('tableArea');
 // These may not exist depending on your HTML — keep safe:
 const playersArea = document.getElementById('playersArea');
 const roomLabel = document.getElementById('roomLabel');
+const sceneSelectInGame = document.getElementById('sceneSelectInGame');
+const deckSelectInGame = document.getElementById('deckSelectInGame');
+const inGameHeader = document.getElementById('inGameHeader');
+
+function updateInGameHeaderVisibility() {
+  if (!inGameHeader) return;
+
+  const gameVisible = gameDiv && gameDiv.style.display !== 'none';
+  const betweenGames = playerStatus === 'active' && readyBtn.style.display !== 'none';
+  inGameHeader.style.display = (gameVisible && betweenGames) ? 'flex' : 'none';
+}
 
 /* ===============================
    TURN INDICATOR (create if missing)
@@ -348,6 +414,9 @@ let draggingEl = null;
 let placeholder = null;
 let selectedScene = 'vampire-bar'; // default scene
 let selectedDeck = '1'; // default deck
+let isMyTurn = false;
+let currentTrickCardCount = null;
+let hasPowerLead = false;
 
 /* ===============================
    WEBRTC & VIDEO STATE
@@ -365,6 +434,54 @@ const ICE_SERVERS = {
     { urls: 'stun:stun1.l.google.com:19302' }
   ]
 };
+
+const SCENE_BACKGROUNDS = {
+  'vampire-bar': '/images/table_background.png',
+  'high-roller': '/images/table_background1.png',
+  'beach-party': '/images/table_background2.png',
+  'japanese-temple': '/images/table_background3.png',
+  'gsu-tailgate': '/images/table_background4.png'
+};
+
+function applyScene(scene) {
+  if (!SCENE_BACKGROUNDS[scene]) return;
+  selectedScene = scene;
+  tableArea.style.backgroundImage = `url('${SCENE_BACKGROUNDS[scene]}')`;
+  if (sceneSelectInGame && sceneSelectInGame.value !== scene) {
+    sceneSelectInGame.value = scene;
+  }
+}
+
+function applyDeck(deckNumber) {
+  const normalizedDeck = String(deckNumber);
+  if (normalizedDeck !== '1' && normalizedDeck !== '2') return;
+  selectedDeck = normalizedDeck;
+  if (deckSelectInGame && deckSelectInGame.value !== normalizedDeck) {
+    deckSelectInGame.value = normalizedDeck;
+  }
+}
+
+function initializeInGameOptions() {
+  if (sceneSelectInGame) {
+    sceneSelectInGame.value = selectedScene;
+    if (!sceneSelectInGame.dataset.bound) {
+      sceneSelectInGame.addEventListener('change', () => {
+        applyScene(sceneSelectInGame.value);
+      });
+      sceneSelectInGame.dataset.bound = 'true';
+    }
+  }
+
+  if (deckSelectInGame) {
+    deckSelectInGame.value = selectedDeck;
+    if (!deckSelectInGame.dataset.bound) {
+      deckSelectInGame.addEventListener('change', () => {
+        applyDeck(deckSelectInGame.value);
+      });
+      deckSelectInGame.dataset.bound = 'true';
+    }
+  }
+}
 
 
 /* ===============================
@@ -451,7 +568,7 @@ const deckButtons = document.querySelectorAll('.deckBtn');
 deckButtons.forEach(btn => {
   btn.addEventListener('click', () => {
     const deckNumber = btn.getAttribute('data-deck');
-    selectedDeck = deckNumber;
+    applyDeck(deckNumber);
     startGame(selectedScene);
   });
 });
@@ -462,22 +579,14 @@ function startGame(scene) {
     
     socket.emit('joinRoom', { playerName, roomId: defaultRoomId });
 
-    // Set table background based on scene
-    const sceneBackgrounds = {
-        'vampire-bar': '/images/table_background.png',
-        'high-roller': '/images/table_background1.png'
-          ,
-        'beach-party': '/images/table_background2.png',
-      'japanese-temple': '/images/table_background3.png',
-      'gsu-tailgate': '/images/table_background4.png'
-    };
-    
-    tableArea.style.backgroundImage = `url('${sceneBackgrounds[scene]}')`;
+    applyScene(scene);
+    initializeInGameOptions();
 
     // Hide lobby and show game
     document.getElementById('lobby').style.display = 'none';
     gameDiv.style.display = 'block';
     if (roomLabel) roomLabel.textContent = 'Main Game';
+    updateInGameHeaderVisibility();
     
     // Open video panel in a separate window by default
     openVideoPanelWindow();
@@ -1043,6 +1152,34 @@ function sortCards(cards) {
         return suitOrder.indexOf(a.suit) - suitOrder.indexOf(b.suit);
     });
 }
+
+    function attemptSingleCardAutoPlay(cardEl) {
+      if (!isMyTurn) return;
+      const isSingleResponse = currentTrickCardCount === 1;
+      const isPowerLeadPlay = currentTrickCardCount === null;
+      if (!isSingleResponse && !isPowerLeadPlay) return;
+
+      const cardData = cardEl?.dataset?.card;
+      if (!cardData) return;
+
+      try {
+        const card = JSON.parse(cardData);
+        if (!card || !card.rank || !card.suit) return;
+        socket.emit('playHand', [card]);
+      } catch (e) {
+        // ignore malformed card payload
+      }
+    }
+
+    function bindCardInteractions(cardEl) {
+      cardEl.addEventListener('click', () => cardEl.classList.toggle('selected'));
+      cardEl.addEventListener('dblclick', () => attemptSingleCardAutoPlay(cardEl));
+      cardEl.draggable = true;
+      cardEl.addEventListener('dragstart', dragStartHandler);
+      cardEl.addEventListener('dragend', dragEndHandler);
+      cardEl.addEventListener('dragover', dragOverHandler);
+      cardEl.addEventListener('drop', dropHandler);
+    }
 /* ===============================
    RENDER PLAYER HAND
 ================================ */
@@ -1061,14 +1198,7 @@ function renderHand() {
         img.classList.add('card-image');
         div.appendChild(img);
 
-        // Select card
-        div.addEventListener('click', () => div.classList.toggle('selected'));
-        // Drag & Drop
-        div.draggable = true;
-        div.addEventListener('dragstart', dragStartHandler);
-        div.addEventListener('dragend', dragEndHandler);
-        div.addEventListener('dragover', dragOverHandler);
-        div.addEventListener('drop', dropHandler);
+        bindCardInteractions(div);
 
         playerHandDiv.appendChild(div);
     });
@@ -1178,13 +1308,8 @@ function animateDealHand(cards) {
             div.style.transition = '';
             div.style.transform = '';
 
-            // Re-enable drag & click
-            div.addEventListener('click', () => div.classList.toggle('selected'));
-            div.draggable = true;
-            div.addEventListener('dragstart', dragStartHandler);
-            div.addEventListener('dragend', dragEndHandler);
-            div.addEventListener('dragover', dragOverHandler);
-            div.addEventListener('drop', dropHandler);
+            // Re-enable interactions after animation
+            bindCardInteractions(div);
 
             playerHandDiv.appendChild(div); // move to hand container
         }, cards.length * 150 + 600);
@@ -1263,6 +1388,7 @@ function dropHandler(e) {
 ================================ */
 socket.on('dealHand', cards => {
   resetGame();
+  updateInGameHeaderVisibility();
   const sorted = sortCards(cards);
   animateDealHand(sorted);
 });
@@ -1317,6 +1443,7 @@ readyBtn.addEventListener('click', () => {
 
     // Hide Ready button after clicking
     readyBtn.style.display = 'none';
+  updateInGameHeaderVisibility();
 
     // Make sure action buttons stay hidden until it's actually this player's turn
     bustBtn.style.display = 'none';
@@ -1483,8 +1610,14 @@ function sortCardsForDisplay(cards, handType) {
 ================================ */
 socket.on('updateTable', (table) => {
   tableArea.innerHTML = '';
+  currentTrickCardCount = (Array.isArray(table) && table.length > 0)
+    ? table[table.length - 1].cards.length
+    : null;
+  if (Array.isArray(table) && table.length > 0) {
+    hasPowerLead = false;
+  }
 
-  const maxHandRotation = 5;
+  const maxHandOffset = 10;
   const maxCardRotation = 3;
 
   table.forEach((play) => {
@@ -1495,8 +1628,10 @@ socket.on('updateTable', (table) => {
     handDiv.style.position = 'absolute';
     handDiv.style.left = '50%';
     handDiv.style.top = '50%';
+    const handOffsetX = (Math.random() * maxHandOffset * 2) - maxHandOffset;
+    const handOffsetY = (Math.random() * maxHandOffset * 2) - maxHandOffset;
     handDiv.style.transform =
-      `translate(-50%, -50%) rotate(${(Math.random() * maxHandRotation * 2) - maxHandRotation}deg)`;
+      `translate(calc(-50% + ${handOffsetX}px), calc(-50% + ${handOffsetY}px))`;
 
     // Ensure multi-card plays go left-to-right
     handDiv.style.display = 'flex';
@@ -1516,7 +1651,8 @@ socket.on('updateTable', (table) => {
       cardDiv.style.backgroundColor = 'white';
 
       const cardRotate = (Math.random() * maxCardRotation * 2) - maxCardRotation;
-      cardDiv.style.transform = `rotate(${cardRotate}deg)`;
+      const cardOffsetY = (Math.random() * 4) - 2;
+      cardDiv.style.transform = `translateY(${cardOffsetY}px) rotate(${cardRotate}deg)`;
 
       const img = document.createElement('img');
       img.src = `/cards/${cardFileName(c)}`;
@@ -1534,7 +1670,10 @@ socket.on('updateTable', (table) => {
    TURN UPDATE (buttons + indicator + video windows)
 ================================ */
 socket.on('turnUpdate', ({ playerId, players, playerCount }) => {
-  const isMyTurn = (mySocketId && playerId === mySocketId);
+  isMyTurn = Boolean(mySocketId && playerId === mySocketId);
+  if (!isMyTurn) {
+    hasPowerLead = false;
+  }
 
   if (isMyTurn) {
     bustBtn.style.display = 'inline-block';
