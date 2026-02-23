@@ -12,6 +12,13 @@ const io = new Server(server);
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
+
+// Disable caching for development to ensure clients get latest updates
+app.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  next();
+});
+
 app.use(express.static(path.join(__dirname, '../client')));
 
 /* ===============================
