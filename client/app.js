@@ -1925,12 +1925,27 @@ async function createPeerConnectionAndOffer(remoteSocketId) {
 socket.on('offer', async ({ from, offer }) => {
   try {
     console.log('📨 Received offer from', from);
+    
+    // Check for offer collision - if we have higher socketId, we should be polite and accept their offer
+    const existingPc = peerConnections[from];
+    const isPolite = mySocketId > from;
+    
+    if (existingPc && existingPc.signalingState === 'have-local-offer' && !isPolite) {
+      console.log('⚠️ Offer collision with', from, '- ignoring (we are impolite)');
+      return;
+    }
+    
     const pc = await createPeerConnection(from);
     
-    // Handle offer collision (glare) - if we're in have-local-offer state, use rollback
+    // Handle offer collision (glare) - if we're in have-local-offer state and we're polite, roll back
     if (pc.signalingState === 'have-local-offer') {
-      console.log('⚠️ Offer collision detected with', from, '- rolling back');
-      await pc.setLocalDescription({ type: 'rollback' });
+      if (isPolite) {
+        console.log('⚠️ Offer collision detected with', from, '- rolling back (we are polite)');
+        await pc.setLocalDescription({ type: 'rollback' });
+      } else {
+        console.log('⚠️ Offer collision detected with', from, '- ignoring (we are impolite)');
+        return;
+      }
     }
     
     await pc.setRemoteDescription(offer);
