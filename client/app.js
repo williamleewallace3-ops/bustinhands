@@ -701,7 +701,6 @@ async function initializeCamera(enableCam = true, enableMic = true) {
                 }
             });
         }
-        }
     } catch (err) {
         console.error('❌ Error accessing camera/mic:', err);
         alert('Could not access camera or microphone. Video features disabled.');
