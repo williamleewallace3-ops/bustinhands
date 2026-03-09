@@ -12,8 +12,8 @@ socket.on('connect', () => {
   mySocketId = socket.id;
   console.log("My socket id:", mySocketId);
   
-  // If we have joined a room before, rejoin on reconnect
-  if (roomId && playerName) {
+  // If we have joined a room before and the game is active, rejoin on reconnect
+  if (roomId && playerName && gameDiv.style.display === 'block') {
     console.log('🔄 Rejoining room after reconnect:', roomId);
     socket.emit('joinRoom', { playerName, roomId });
   }
