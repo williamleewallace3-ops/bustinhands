@@ -704,6 +704,19 @@ async function initializeCamera(enableCam = true, enableMic = true) {
                 }
             });
         }
+        
+        // Renegotiate for connections that are stable to send tracks
+        for (const socketId of Object.keys(peerConnections)) {
+            const pc = peerConnections[socketId];
+            if (pc && pc.signalingState === 'stable' && pc.localDescription && pc.remoteDescription) {
+                pc.createOffer().then(offer => {
+                    return pc.setLocalDescription(offer);
+                }).then(() => {
+                    socket.emit('offer', { to: socketId, offer: pc.localDescription });
+                    console.log('📤 Sent renegotiation offer to', socketId);
+                }).catch(err => console.error('Renegotiation failed:', err));
+            }
+        }
     } catch (err) {
         console.error('❌ Error accessing camera/mic:', err);
         alert('Could not access camera or microphone. Video features disabled.');
