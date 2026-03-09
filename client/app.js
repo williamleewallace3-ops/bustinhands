@@ -369,6 +369,7 @@ function displayRevealedHand(socketId, playerName, cards) {
 const lobbyDiv = document.getElementById('lobby');
 const gameDiv = document.getElementById('game');
 const joinBtn = document.getElementById('joinBtn');
+console.log('joinBtn:', joinBtn);
 const readyBtn = document.getElementById('readyBtn');
 const bustBtn = document.getElementById('bustBtn');
 const passBtn = document.getElementById('passBtn');
@@ -531,12 +532,14 @@ function cardFileName(card) {
    JOIN ROOM
 ================================ */
 joinBtn.addEventListener('click', () => {
+    console.log('Join button clicked');
     playerName = document.getElementById('playerName').value.trim();
     if (!playerName) return alert("Enter your name");
 
     // Show scene selection instead of going directly to game
     const lobbyOverlay = document.getElementById('lobbyOverlay');
     const sceneOverlay = document.getElementById('sceneOverlay');
+    console.log('lobbyOverlay:', lobbyOverlay, 'sceneOverlay:', sceneOverlay);
     
     lobbyOverlay.style.display = 'none';
     sceneOverlay.style.display = 'flex';
