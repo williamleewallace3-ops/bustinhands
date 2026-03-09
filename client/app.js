@@ -1102,19 +1102,6 @@ async function createPeerConnection(remoteSocketId) {
         });
     }
     
-    // Add local stream tracks to peer connection if available
-    if (localStream) {
-        localStream.getTracks().forEach(track => {
-            const transceiver = peerConnection.getTransceivers().find(t => t.sender.track?.kind === track.kind);
-            if (transceiver) {
-                transceiver.sender.replaceTrack(track);
-                transceiver.direction = 'sendrecv';
-            } else {
-                peerConnection.addTrack(track, localStream);
-            }
-        });
-    }
-    
     // Handle remote stream
     peerConnection.ontrack = (event) => {
         console.log('✅ Received remote track from', remoteSocketId, '- kind:', event.track.kind);
