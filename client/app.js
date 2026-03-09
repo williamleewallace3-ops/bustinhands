@@ -424,6 +424,7 @@ let hasPowerLead = false;
 let localStream = null;
 let peerConnections = {}; // socketId -> RTCPeerConnection
 let dataChannels = {}; // socketId -> RTCDataChannel
+let remoteStreams = {}; // socketId -> MediaStream used for accumulating tracks when event.streams is empty
 let playerLayout = {}; // socketId -> window position (topLeft, topRight, bottomLeft, bottomRight)
 let playerStats = {}; // socketId -> { name, wins, gamesPlayed, winPercent, cardsRemaining }
 let activePlayer = null; // socketId of player whose turn it is
@@ -678,24 +679,30 @@ async function initializeCamera(enableCam = true, enableMic = true) {
             }
         }
         
-        // Add tracks to ALL existing peer connections if they don't have them
+        // Add tracks to ALL existing peer connections, but make sure we include
+        // both audio and video even if one kind was already present.  The old
+        // check only looked for *any* active sender, so a connection with
+        // audio but no video would be skipped entirely and the other side would
+        // never see the camera (which is what caused the "third person can't
+        // see the second" symptom).
         for (const socketId of Object.keys(peerConnections)) {
             const pc = peerConnections[socketId];
             if (!pc) continue;
-            
+
             const senders = pc.getSenders();
-            const hasActiveTracks = senders.some(sender => sender.track !== null);
-            
-            if (!hasActiveTracks && localStream) {
-                console.log('🔄 Adding tracks to peer connection:', socketId);
-                
-                // Add all tracks from local stream
+            const existingKinds = new Set(
+                senders.filter(s => s.track).map(s => s.track.kind)
+            );
+
+            if (localStream) {
                 localStream.getTracks().forEach(track => {
-                    pc.addTrack(track, localStream);
-                    console.log('  Added', track.kind, 'track');
+                    if (!existingKinds.has(track.kind)) {
+                        console.log('🔄 Adding', track.kind, 'track to peer connection:', socketId);
+                        pc.addTrack(track, localStream);
+                    } else {
+                        console.log('✅ Peer connection', socketId, 'already has', track.kind, 'track');
+                    }
                 });
-            } else if (hasActiveTracks) {
-                console.log('✅ Peer connection', socketId, 'already has active tracks');
             }
         }
     } catch (err) {
@@ -1088,11 +1095,25 @@ async function createPeerConnection(remoteSocketId) {
     peerConnection.ontrack = (event) => {
         console.log('✅ Received remote track from', remoteSocketId, '- kind:', event.track.kind);
         console.log('Remote streams:', event.streams);
+
+        let streamToUse;
         if (event.streams && event.streams.length > 0) {
-            displayRemoteStream(remoteSocketId, event.streams[0]);
+            streamToUse = event.streams[0];
+        } else {
+            // No stream array provided.  We may get separate ontrack events for
+            // video and audio, so stash them in a persistent MediaStream so we
+            // don't replace the video with an audio-only stream or vice versa.
+            if (!remoteStreams[remoteSocketId]) {
+                remoteStreams[remoteSocketId] = new MediaStream();
+            }
+            console.log('ℹ️ ontrack event had no streams, adding track to accumulated stream');
+            remoteStreams[remoteSocketId].addTrack(event.track);
+            streamToUse = remoteStreams[remoteSocketId];
         }
+
+        displayRemoteStream(remoteSocketId, streamToUse);
     };
-    
+
     // Handle connection state changes
     peerConnection.onconnectionstatechange = () => {
         console.log('Connection state for', remoteSocketId, ':', peerConnection.connectionState);
@@ -1137,6 +1158,7 @@ async function createPeerConnection(remoteSocketId) {
 
 function displayRemoteStream(remoteSocketId, stream) {
     console.log('Displaying remote stream from', remoteSocketId);
+    console.log('Stream tracks:', stream.getTracks().map(t => t.kind));
     
     // Use locally tracked player name or placeholder
     const playerName = playerNames[remoteSocketId] || `Player ${remoteSocketId.substring(0, 4)}`;
