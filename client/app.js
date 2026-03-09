@@ -1166,6 +1166,11 @@ function displayRemoteStream(remoteSocketId, stream) {
     console.log('Displaying remote stream from', remoteSocketId);
     console.log('Stream tracks:', stream.getTracks().map(t => t.kind));
     
+    // Check if stream has video
+    const hasVideo = stream.getVideoTracks().length > 0;
+    const hasAudio = stream.getAudioTracks().length > 0;
+    console.log('Stream has video:', hasVideo, 'audio:', hasAudio);
+    
     // Use locally tracked player name or placeholder
     const playerName = playerNames[remoteSocketId] || `Player ${remoteSocketId.substring(0, 4)}`;
     const isWaiting = waitingPlayers.includes(remoteSocketId);
