@@ -11,6 +11,12 @@ let myOwnStats = null; // Store own stats until camera feed is created
 socket.on('connect', () => {
   mySocketId = socket.id;
   console.log("My socket id:", mySocketId);
+  
+  // If we have joined a room before, rejoin on reconnect
+  if (roomId && playerName) {
+    console.log('🔄 Rejoining room after reconnect:', roomId);
+    socket.emit('joinRoom', { playerName, roomId });
+  }
 });
 
 /* ===============================
@@ -679,29 +685,21 @@ async function initializeCamera(enableCam = true, enableMic = true) {
             }
         }
         
-        // Add tracks to ALL existing peer connections, but make sure we include
-        // both audio and video even if one kind was already present.  The old
-        // check only looked for *any* active sender, so a connection with
-        // audio but no video would be skipped entirely and the other side would
-        // never see the camera (which is what caused the "third person can't
-        // see the second" symptom).
+        // Add tracks to ALL existing peer connections
         for (const socketId of Object.keys(peerConnections)) {
             const pc = peerConnections[socketId];
             if (!pc) continue;
 
-            const senders = pc.getSenders();
-            const existingKinds = new Set(
-                senders.filter(s => s.track).map(s => s.track.kind)
-            );
-
-            if (localStream) {
-                localStream.getTracks().forEach(track => {
-                    if (!existingKinds.has(track.kind)) {
-                        console.log('🔄 Adding', track.kind, 'track to peer connection:', socketId);
-                        pc.addTrack(track, localStream);
-                    } else {
-                        console.log('✅ Peer connection', socketId, 'already has', track.kind, 'track');
-                    }
+            localStream.getTracks().forEach(track => {
+                const transceiver = pc.getTransceivers().find(t => t.sender && t.sender.track?.kind === track.kind);
+                if (transceiver) {
+                    console.log('🔄 Replacing', track.kind, 'track in transceiver for peer connection:', socketId);
+                    transceiver.sender.replaceTrack(track);
+                    transceiver.direction = 'sendrecv';
+                } else {
+                    console.log('ℹ️ No matching transceiver for', track.kind, 'in peer connection:', socketId);
+                }
+            });
                 });
             }
         }
@@ -1084,10 +1082,20 @@ async function createPeerConnection(remoteSocketId) {
     const peerConnection = new RTCPeerConnection(ICE_SERVERS);
     peerConnections[remoteSocketId] = peerConnection;
     
-    // Add local stream tracks to peer connection
+    // Add transceivers for audio and video to allow receiving even without local stream
+    peerConnection.addTransceiver('audio', { direction: 'recvonly' });
+    peerConnection.addTransceiver('video', { direction: 'recvonly' });
+    
+    // Add local stream tracks to peer connection if available
     if (localStream) {
         localStream.getTracks().forEach(track => {
-            peerConnection.addTrack(track, localStream);
+            const transceiver = peerConnection.getTransceivers().find(t => t.sender.track?.kind === track.kind);
+            if (transceiver) {
+                transceiver.sender.replaceTrack(track);
+                transceiver.direction = 'sendrecv';
+            } else {
+                peerConnection.addTrack(track, localStream);
+            }
         });
     }
     
