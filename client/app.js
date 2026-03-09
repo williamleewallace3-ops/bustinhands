@@ -691,13 +691,14 @@ async function initializeCamera(enableCam = true, enableMic = true) {
             if (!pc) continue;
 
             localStream.getTracks().forEach(track => {
-                const transceiver = pc.getTransceivers().find(t => t.sender && t.sender.track?.kind === track.kind);
-                if (transceiver) {
-                    console.log('🔄 Replacing', track.kind, 'track in transceiver for peer connection:', socketId);
+                const transceiver = pc.getTransceivers().find(t => t.sender && (!t.sender.track || t.sender.track.kind === track.kind));
+                if (transceiver && !transceiver.sender.track) {
+                    console.log('🔄 Adding', track.kind, 'track to transceiver for peer connection:', socketId);
                     transceiver.sender.replaceTrack(track);
-                    transceiver.direction = 'sendrecv';
+                } else if (transceiver && transceiver.sender.track) {
+                    console.log('✅ Transceiver for', track.kind, 'already has track in peer connection:', socketId);
                 } else {
-                    console.log('ℹ️ No matching transceiver for', track.kind, 'in peer connection:', socketId);
+                    console.log('ℹ️ No suitable transceiver for', track.kind, 'in peer connection:', socketId);
                 }
             });
         }
@@ -1080,9 +1081,9 @@ async function createPeerConnection(remoteSocketId) {
     const peerConnection = new RTCPeerConnection(ICE_SERVERS);
     peerConnections[remoteSocketId] = peerConnection;
     
-    // Add transceivers for audio and video to allow receiving even without local stream
-    peerConnection.addTransceiver('audio', { direction: 'recvonly' });
-    peerConnection.addTransceiver('video', { direction: 'recvonly' });
+    // Add transceivers for audio and video to allow sending and receiving
+    peerConnection.addTransceiver('audio', { direction: 'sendrecv' });
+    peerConnection.addTransceiver('video', { direction: 'sendrecv' });
     
     // Add local stream tracks to peer connection if available
     if (localStream) {
