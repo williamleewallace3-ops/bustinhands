@@ -690,15 +690,17 @@ async function initializeCamera(enableCam = true, enableMic = true) {
             const pc = peerConnections[socketId];
             if (!pc) continue;
 
-            localStream.getTracks().forEach(track => {
-                const transceiver = pc.getTransceivers().find(t => t.sender && (!t.sender.track || t.sender.track.kind === track.kind));
-                if (transceiver && !transceiver.sender.track) {
-                    console.log('🔄 Adding', track.kind, 'track to transceiver for peer connection:', socketId);
-                    transceiver.sender.replaceTrack(track);
-                } else if (transceiver && transceiver.sender.track) {
-                    console.log('✅ Transceiver for', track.kind, 'already has track in peer connection:', socketId);
-                } else {
-                    console.log('ℹ️ No suitable transceiver for', track.kind, 'in peer connection:', socketId);
+            const transceivers = pc.getTransceivers();
+            localStream.getAudioTracks().forEach(track => {
+                if (transceivers[0] && !transceivers[0].sender.track) {
+                    console.log('🔄 Adding audio track to transceiver for peer connection:', socketId);
+                    transceivers[0].sender.replaceTrack(track);
+                }
+            });
+            localStream.getVideoTracks().forEach(track => {
+                if (transceivers[1] && !transceivers[1].sender.track) {
+                    console.log('🔄 Adding video track to transceiver for peer connection:', socketId);
+                    transceivers[1].sender.replaceTrack(track);
                 }
             });
         }
@@ -1087,12 +1089,15 @@ async function createPeerConnection(remoteSocketId) {
     
     // Add local stream tracks to peer connection if available
     if (localStream) {
-        localStream.getTracks().forEach(track => {
-            const transceiver = peerConnection.getTransceivers().find(t => t.sender && !t.sender.track && t.sender.track?.kind !== track.kind);
-            if (transceiver) {
-                transceiver.sender.replaceTrack(track);
-            } else {
-                peerConnection.addTrack(track, localStream);
+        const transceivers = peerConnection.getTransceivers();
+        localStream.getAudioTracks().forEach(track => {
+            if (transceivers[0] && !transceivers[0].sender.track) {
+                transceivers[0].sender.replaceTrack(track);
+            }
+        });
+        localStream.getVideoTracks().forEach(track => {
+            if (transceivers[1] && !transceivers[1].sender.track) {
+                transceivers[1].sender.replaceTrack(track);
             }
         });
     }
