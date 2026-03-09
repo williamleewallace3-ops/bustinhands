@@ -1088,6 +1088,18 @@ async function createPeerConnection(remoteSocketId) {
     // Add local stream tracks to peer connection if available
     if (localStream) {
         localStream.getTracks().forEach(track => {
+            const transceiver = peerConnection.getTransceivers().find(t => t.sender && !t.sender.track && t.sender.track?.kind !== track.kind);
+            if (transceiver) {
+                transceiver.sender.replaceTrack(track);
+            } else {
+                peerConnection.addTrack(track, localStream);
+            }
+        });
+    }
+    
+    // Add local stream tracks to peer connection if available
+    if (localStream) {
+        localStream.getTracks().forEach(track => {
             const transceiver = peerConnection.getTransceivers().find(t => t.sender.track?.kind === track.kind);
             if (transceiver) {
                 transceiver.sender.replaceTrack(track);
