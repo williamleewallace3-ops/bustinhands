@@ -434,6 +434,10 @@ let remoteStreams = {}; // socketId -> MediaStream used for accumulating tracks 
 let playerLayout = {}; // socketId -> window position (topLeft, topRight, bottomLeft, bottomRight)
 let playerStats = {}; // socketId -> { name, wins, gamesPlayed, winPercent, cardsRemaining }
 let activePlayer = null; // socketId of player whose turn it is
+let pendingOffers = []; // Queue of offers to handle after camera is ready
+let pendingIceCandidates = {}; // socketId -> array of ICE candidates to add when PC is created
+let feedMonitorInterval = null; // Interval for checking/retrying missing feeds
+let lastRenegotiationAttempt = {}; // Track when we last tried to renegotiate with each peer
 
 const ICE_SERVERS = {
   iceServers: [
@@ -674,14 +678,83 @@ async function initializeCamera(enableCam = true, enableMic = true) {
             updatePlayerFeedStats(mySocketId, myOwnStats);
         }
         
-        // Create peer connections with players who joined before camera was ready
-        // Use the same socketId comparison logic as existingPlayers/newPlayerJoined handlers
+        // FIRST: Handle any offers that came in before camera was ready
+        // This ensures we respond to their offers before creating our own
+        if (pendingOffers.length > 0) {
+            console.log('📨 Processing', pendingOffers.length, 'pending offers now that camera is ready');
+            const offersToProcess = pendingOffers.splice(0); // Get all pending offers
+            for (const { from, offer } of offersToProcess) {
+                try {
+                    // Create peer connection or reuse existing
+                    const pc = await createPeerConnection(from);
+                    const isPolite = mySocketId > from;
+                    
+                    // If we have a local offer already, handle collision
+                    if (pc.signalingState === 'have-local-offer') {
+                        if (isPolite) {
+                            console.log('⚠️ Pending offer collision with', from, '- rolling back (polite)');
+                            await pc.setLocalDescription({ type: 'rollback' });
+                        } else {
+                            console.log('⚠️ Pending offer collision with', from, '- we stay impolite, ignore theirs');
+                            continue;
+                        }
+                    }
+                    
+                    // Set their offer as remote description
+                    await pc.setRemoteDescription(offer);
+                    console.log('  🔗 Remote description set for pending offer from', from);
+                    
+                    // CRITICAL FIX: Change all recvonly transceivers to sendrecv for the answer
+                    const txceivers = pc.getTransceivers();
+                    console.log('    🎬 Checking transceivers - total:', txceivers.length);
+                    
+                    try {
+                      for (let i = 0; i < txceivers.length; i++) {
+                        const t = txceivers[i];
+                        if (t.direction === 'recvonly') {
+                          t.direction = 'sendrecv';
+                          console.log(`      🔄 Changed transceiver[${i}] from recvonly to sendrecv`);
+                        }
+                      }
+                      console.log('      ✅ All recvonly transceivers changed to sendrecv');
+                    } catch (err) {
+                      console.warn('    ⚠️ Error updating directions:', err.message);
+                    }
+                    
+                    // Process any queued ICE candidates for this connection
+                    if (pc.pendingIceCandidates && pc.pendingIceCandidates.length > 0) {
+                        console.log('📥 Processing', pc.pendingIceCandidates.length, 'queued ICE candidates for', from);
+                        for (const candidate of pc.pendingIceCandidates) {
+                            try {
+                                await pc.addIceCandidate(new RTCIceCandidate(candidate));
+                            } catch (err) {
+                                console.error('❌ Error adding ICE candidate:', err);
+                            }
+                        }
+                        pc.pendingIceCandidates = [];
+                    }
+                    
+                    // Create and send answer
+                    console.log('📝 Creating answer for pending offer from', from);
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    socket.emit('answer', { to: from, answer });
+                    console.log('📤 Sent answer to', from);
+                } catch (err) {
+                    console.error('❌ Error processing pending offer from', from, ':', err);
+                }
+            }
+        }
+        
+        // SECOND: Create peer connections with players who joined before camera was ready
+        // For players we haven't already connected to via pending offers
         const existingPlayerIds = Object.keys(playerNames).filter(id => id !== mySocketId);
         for (const playerId of existingPlayerIds) {
             if (!peerConnections[playerId]) {
-                console.log('📞 Creating peer connection after camera init:', playerId);
-                // Use socketId comparison to decide who creates offer (avoid glare)
+                console.log('📞 Creating new peer connection after camera init:', playerId);
                 await createPeerConnectionAndOffer(playerId);
+            } else {
+                console.log('✅ Already have connection with', playerId, 'from pending offer response');
             }
         }
         
@@ -717,6 +790,18 @@ async function initializeCamera(enableCam = true, enableMic = true) {
                 }).catch(err => console.error('Renegotiation failed:', err));
             }
         }
+        
+        // Request fresh offers from all existing players to ensure we get their video feeds
+        console.log('🔄 Requesting fresh offers from all existing players');
+        for (const socketId of Object.keys(peerConnections)) {
+            if (socketId !== mySocketId) {
+                console.log('  📨 Requesting offer from', socketId);
+                socket.emit('requestOffer', { to: socketId });
+            }
+        }
+        
+        // Start monitoring feeds for failures and retrying
+        startFeedMonitor();
     } catch (err) {
         console.error('❌ Error accessing camera/mic:', err);
         alert('Could not access camera or microphone. Video features disabled.');
@@ -747,10 +832,14 @@ function createPlayerFeed(socketId, playerName, stream, isLocal = false, isWaiti
     
     // Video element - MUST be in main document for WebRTC streams
     const video = document.createElement('video');
+    video.className = 'player-feed-video';
     video.autoplay = true;
     video.playsinline = true;
     video.muted = isLocal; // Mute own feed to prevent echo
-    video.srcObject = stream;
+    if (stream) {
+        video.srcObject = stream;
+        video.play().catch(err => console.warn('⚠️ Video play failed:', err));
+    }
     
     // Player position badge
     const positionBadge = document.createElement('div');
@@ -1090,29 +1179,51 @@ window.addEventListener('DOMContentLoaded', () => {
 ================================ */
 async function createPeerConnection(remoteSocketId) {
     if (peerConnections[remoteSocketId]) {
+        console.log('♻️ Reusing existing peer connection for', remoteSocketId);
         return peerConnections[remoteSocketId];
     }
     
+    console.log('🔨 Creating NEW peer connection for', remoteSocketId, '- localStream available:', !!localStream);
     const peerConnection = new RTCPeerConnection(ICE_SERVERS);
     peerConnections[remoteSocketId] = peerConnection;
     
-    // Add transceivers for audio and video to allow sending and receiving
-    peerConnection.addTransceiver('audio', { direction: 'sendrecv' });
-    peerConnection.addTransceiver('video', { direction: 'sendrecv' });
+    // Ensure feed placeholder exists before tracks arrive
+    if (!playerFeeds[remoteSocketId]) {
+        const playerName = playerNames[remoteSocketId] || `Player ${remoteSocketId.substring(0, 4)}`;
+        const isWaiting = waitingPlayers && waitingPlayers.includes(remoteSocketId);
+        createPlayerFeed(remoteSocketId, playerName, null, false, isWaiting);
+    }
+
+    // Don't pre-create transceivers - they'll be created naturally from offers or from addTrack
+    // This avoids the problem of having unused transceivers [0,1] while answer uses [2,3]
+    console.log('📡 Peer connection ready for', remoteSocketId);
     
-    // Add local stream tracks to peer connection if available
+    // Immediately add local stream tracks using addTrack (creates transceivers with proper direction)
     if (localStream) {
-        const transceivers = peerConnection.getTransceivers();
+        console.log('🎬 Adding local stream tracks to', remoteSocketId, '- using addTrack');
+        let audioAdded = false, videoAdded = false;
+        
         localStream.getAudioTracks().forEach(track => {
-            if (transceivers[0] && !transceivers[0].sender.track) {
-                transceivers[0].sender.replaceTrack(track);
+            console.log('  🔊 Audio track:', track.id, 'enabled:', track.enabled);
+            if (!audioAdded) {
+                console.log('  ➕ Adding audio via addTrack');
+                peerConnection.addTrack(track, localStream);
+                audioAdded = true;
             }
         });
+        
         localStream.getVideoTracks().forEach(track => {
-            if (transceivers[1] && !transceivers[1].sender.track) {
-                transceivers[1].sender.replaceTrack(track);
+            console.log('  📹 Video track:', track.id, 'enabled:', track.enabled);
+            if (!videoAdded) {
+                console.log('  ➕ Adding video via addTrack');
+                peerConnection.addTrack(track, localStream);
+                videoAdded = true;
             }
         });
+        
+        console.log('✅ Tracks added - audio:', audioAdded, 'video:', videoAdded);
+    } else {
+        console.log('⚠️ NO localStream available for', remoteSocketId, '- tracks cannot be sent!');
     }
     
     // Handle remote stream
@@ -1177,7 +1288,104 @@ async function createPeerConnection(remoteSocketId) {
         }
     };
     
+    // Apply any ICE candidates that arrived before this connection was created
+    if (pendingIceCandidates[remoteSocketId] && pendingIceCandidates[remoteSocketId].length > 0) {
+        console.log('📥 Applying', pendingIceCandidates[remoteSocketId].length, 'pending ICE candidates to', remoteSocketId);
+        // Queue them on the new connection to be added when remote description is set
+        if (!peerConnection.pendingIceCandidates) {
+            peerConnection.pendingIceCandidates = [];
+        }
+        peerConnection.pendingIceCandidates.push(...pendingIceCandidates[remoteSocketId]);
+        pendingIceCandidates[remoteSocketId] = []; // Clear the global queue
+    }
+    
     return peerConnection;
+}
+
+/* ===============================
+   FEED MONITORING & RETRY SYSTEM
+================================ */
+function startFeedMonitor() {
+    // Stop any existing monitor
+    if (feedMonitorInterval) {
+        clearInterval(feedMonitorInterval);
+    }
+    
+    // Check feeds every 2 seconds
+    feedMonitorInterval = setInterval(() => {
+        monitorAndRetryFeeds();
+    }, 2000);
+    
+    console.log('📡 Feed monitor started (checking every 2s)');
+}
+
+function stopFeedMonitor() {
+    if (feedMonitorInterval) {
+        clearInterval(feedMonitorInterval);
+        feedMonitorInterval = null;
+        console.log('🛑 Feed monitor stopped');
+    }
+}
+
+function monitorAndRetryFeeds() {
+    const now = Date.now();
+    const RENEGOTIATION_COOLDOWN = 8000; // Wait at least 8 seconds between renegotiation attempts
+    const MAX_RENEGOTIATION_ATTEMPTS = 1; // Only retry once before giving up
+    
+    for (const socketId of Object.keys(peerConnections)) {
+        const pc = peerConnections[socketId];
+        if (!pc || (pc.connectionState !== 'connected' && pc.iceConnectionState !== 'connected')) {
+            continue; // Skip if connection isn't in a good state
+        }
+        
+        // Check if this peer's video feed has video tracks
+        const feed = playerFeeds[socketId];
+        if (!feed) continue;
+        
+        const stream = feed.video?.srcObject;
+        const hasVideo = stream && stream.getVideoTracks && stream.getVideoTracks().length > 0;
+        
+        // If we have video, mark this peer as complete and stop retrying
+        if (hasVideo) {
+            if (lastRenegotiationAttempt[socketId] !== 'complete') {
+                console.log('✅ Confirmed video feed from', socketId, '- stopping retry monitoring');
+                lastRenegotiationAttempt[socketId] = 'complete';
+            }
+            continue; // Don't retry peers with video
+        }
+        
+        // Skip if we've already marked this as complete
+        if (lastRenegotiationAttempt[socketId] === 'complete') {
+            continue;
+        }
+        
+        const lastAttempt = lastRenegotiationAttempt[socketId] || 0;
+        
+        // Only try renegotiation once, after a delay
+        if (typeof lastAttempt === 'number' && now - lastAttempt < RENEGOTIATION_COOLDOWN) {
+            continue; // Too soon to retry
+        }
+        
+        // Try renegotiation only once
+        if (!lastRenegotiationAttempt[socketId]) {
+            console.log('🔄 Missing video for', socketId, '- attempting renegotiation (attempt 1/' + MAX_RENEGOTIATION_ATTEMPTS + ')');
+            lastRenegotiationAttempt[socketId] = now;
+                
+                // Request new offer from remote peer
+                socket.emit('requestOffer', { to: socketId });
+                
+                // Also try creating new offer ourselves if stable
+                if (pc.signalingState === 'stable' && pc.localDescription && pc.remoteDescription) {
+                    pc.createOffer()
+                        .then(offer => pc.setLocalDescription(offer))
+                        .then(() => {
+                            socket.emit('offer', { to: socketId, offer: pc.localDescription });
+                            console.log('📤 Sent renegotiation offer to', socketId);
+                        })
+                        .catch(err => console.warn('⚠️ Renegotiation offer failed for', socketId, ':', err));
+                }
+        }
+    }
 }
 
 function displayRemoteStream(remoteSocketId, stream) {
@@ -1199,6 +1407,7 @@ function displayRemoteStream(remoteSocketId, stream) {
         const feed = playerFeeds[remoteSocketId];
         if (feed.video) {
             feed.video.srcObject = stream;
+            feed.video.play().catch(err => console.warn('⚠️ Video play failed for', remoteSocketId, ':', err));
         }
         // Update name if we now have it
         if (playerNames[remoteSocketId] && feed.nameDiv) {
@@ -1961,7 +2170,9 @@ async function createPeerConnectionAndOffer(remoteSocketId) {
       console.log('📞 Creating offer for', remoteSocketId);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+      console.log('📤 Sending offer to', remoteSocketId);
       socket.emit('offer', { to: remoteSocketId, offer });
+      console.log('✅ Offer emitted to', remoteSocketId);
     } else {
       console.log('⏳ Waiting for offer from', remoteSocketId);
     }
@@ -1975,18 +2186,42 @@ async function createPeerConnectionAndOffer(remoteSocketId) {
 ================================ */
 socket.on('offer', async ({ from, offer }) => {
   try {
+    // If camera not initialized yet, queue this offer to handle after initialization
+    if (!localStream) {
+      console.log('⏳ Camera not ready, queuing offer from', from);
+      pendingOffers.push({ from, offer });
+      return;
+    }
+    
     console.log('📨 Received offer from', from);
+    console.log('  🔍 Existing PC:', !!peerConnections[from], 'localStream:', !!localStream);
     
     // Check for offer collision - if we have higher socketId, we should be polite and accept their offer
     const existingPc = peerConnections[from];
     const isPolite = mySocketId > from;
     
-    if (existingPc && existingPc.signalingState === 'have-local-offer' && !isPolite) {
-      console.log('⚠️ Offer collision with', from, '- ignoring (we are impolite)');
+    // During initial connection (have-local-offer with no remote description), use politeness
+    // But once connection is established, always accept offers for renegotiation/recovery
+    const isInitialHandshake = existingPc && existingPc.signalingState === 'have-local-offer' && !existingPc.remoteDescription;
+    
+    console.log('  PC state:', existingPc?.signalingState, 'isPolite:', isPolite, 'isInitialHandshake:', isInitialHandshake);
+    
+    if (isInitialHandshake && !isPolite) {
+      console.log('⚠️ Initial offer collision with', from, '- ignoring (we are impolite)');
       return;
     }
     
     const pc = await createPeerConnection(from);
+    console.log('  ✅ PC ready, signaling state:', pc.signalingState);
+    
+    // Check if we're missing video from this peer
+    const isMissingVideoFromPeer = !lastRenegotiationAttempt[from] || lastRenegotiationAttempt[from] !== 'complete';
+    
+    // If we already have a remote description AND signaling state is not stable, skip UNLESS we're missing video from this peer
+    if (pc.remoteDescription && pc.signalingState !== 'stable' && !isMissingVideoFromPeer) {
+      console.log('⏭️  Skipping offer from', from, '- signaling in progress and video confirmed');
+      return;
+    }
     
     // Handle offer collision (glare) - if we're in have-local-offer state and we're polite, roll back
     if (pc.signalingState === 'have-local-offer') {
@@ -1999,7 +2234,27 @@ socket.on('offer', async ({ from, offer }) => {
       }
     }
     
+    console.log('  🔗 About to set remote description for', from);
     await pc.setRemoteDescription(offer);
+    console.log('  🔗 Remote description set');
+    
+    // CRITICAL FIX: When offer arrives, browser creates recvonly transceivers for incoming media
+    // We need to change ALL recvonly transceivers to sendrecv so answer includes our sending tracks
+    let transceivers = pc.getTransceivers();
+    console.log('  🎬 Checking transceivers after setRemoteDescription - total:', transceivers.length);
+    
+    try {
+      for (let i = 0; i < transceivers.length; i++) {
+        const t = transceivers[i];
+        if (t.direction === 'recvonly') {
+          t.direction = 'sendrecv';
+          console.log(`  🔄 Changed transceiver[${i}] from recvonly to sendrecv`);
+        }
+      }
+      console.log('✅ All recvonly transceivers changed to sendrecv');
+    } catch (err) {
+      console.warn('  ⚠️ Error updating transceiver directions:', err.message);
+    }
     
     // Process any queued ICE candidates
     if (pc.pendingIceCandidates && pc.pendingIceCandidates.length > 0) {
@@ -2014,48 +2269,136 @@ socket.on('offer', async ({ from, offer }) => {
       pc.pendingIceCandidates = [];
     }
     
+    // Debug: Check transceiver state before creating answer
+    console.log('🔍 Transceiver state before answer for', from, ':');
+    transceivers.forEach((t, i) => {
+      console.log(`  [${i}] direction: ${t.direction}, sender.track: ${t.sender.track ? '✅ ' + t.sender.track.kind : '❌ null'}`);
+    });
+    
     console.log('📝 Creating answer for', from);
     const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
+    console.log('  📦 Answer created, answer object keys:', Object.keys(answer));
     
-    console.log('📤 Sending answer to', from);
+    // Log SDP to verify tracks are included
+    const answerSDP = answer.sdp;
+    const hasAudioM = answerSDP.includes('m=audio');
+    const hasVideoM = answerSDP.includes('m=video');
+    const audioRecvLines = (answerSDP.match(/a=recvonly|a=sendrecv/g) || []).length;
+    console.log(`  📋 Answer SDP: audio=${hasAudioM} video=${hasVideoM} recv-capable lines=${audioRecvLines}`);
+    console.log('  📋 SDP media lines:', (answerSDP.match(/^m=/gm) || []).length, 'lines');
+    console.log('  📋 First 200 chars of SDP:', answerSDP.substring(0, 200));
+    console.log('  Answer object type:', answer.type, 'SDP length:', answer.sdp?.length);
+    
+    await pc.setLocalDescription(answer);
+    console.log('  ✅ Local description set');
+    
+    console.log('📤 Sending answer to', from, 'answer object structure: type=' + answer.type + ' sdp.length=' + answer.sdp.length);
     socket.emit('answer', { to: from, answer });
+    console.log('  ✅ Answer emitted via socket');
   } catch (err) {
     console.error('❌ Error handling offer from', from, ':', err);
   }
 });
 
 socket.on('answer', async ({ from, answer }) => {
+  console.log('📨 Received answer from', from, 'answer object:', answer);
   try {
-    console.log('📨 Received answer from', from);
     const pc = peerConnections[from];
-    if (pc) {
-      if (pc.signalingState === 'have-local-offer') {
-        await pc.setRemoteDescription(answer);
-        console.log('✅ Remote description set for', from);
-        
-        // Process any queued ICE candidates
-        if (pc.pendingIceCandidates && pc.pendingIceCandidates.length > 0) {
-          console.log('📥 Processing', pc.pendingIceCandidates.length, 'queued ICE candidates for', from);
-          for (const candidate of pc.pendingIceCandidates) {
-            try {
-              await pc.addIceCandidate(new RTCIceCandidate(candidate));
-            } catch (err) {
-              console.error('❌ Error adding queued ICE candidate:', err);
-            }
-          }
-          pc.pendingIceCandidates = [];
+    console.log('  PC exists?', !!pc, 'Answer type?', answer?.type, 'Answer SDP length?', answer?.sdp?.length);
+    
+    if (!pc) {
+      console.warn('❌ ANSWER FAILED: No peer connection found for', from);
+      return;
+    }
+    
+    if (!answer) {
+      console.warn('❌ ANSWER FAILED: No answer data from', from);
+      return;
+    }
+    
+    if (!answer.type || !answer.sdp) {
+      console.warn('❌ ANSWER FAILED: Invalid answer structure from', from, 'type:', answer.type, 'has SDP?', !!answer.sdp);
+      return;
+    }
+    
+    console.log('  Current signaling state:', pc.signalingState);
+    
+    // Only accept answers when we're expecting one (have a pending offer)
+    // The state machine handles renegotiation: even after prior remote description,
+    // if we send a new offer, state becomes 'have-local-offer' again and we accept the new answer
+    if (pc.signalingState !== 'have-local-offer') {
+      console.log('⏭️ Skipping answer from', from, '- not expecting answer (signaling state:', pc.signalingState + ')');
+      return;
+    }
+    
+    console.log('  ✅ Proceeding to setRemoteDescription for', from);
+    try {
+      console.log('  About to call setRemoteDescription with answer type:', answer.type);
+      await pc.setRemoteDescription(answer);
+      console.log('✅ Remote description set for', from, 'new signaling state:', pc.signalingState);
+    } catch (err) {
+      console.error('❌ SETREMOTEDESCRIPTION FAILED for', from, 'error:', err.message, 'error name:', err.name, 'signaling state was:', pc.signalingState);
+      return;
+    }
+    
+    // Process any queued ICE candidates
+    if (pc.pendingIceCandidates && pc.pendingIceCandidates.length > 0) {
+      console.log('📥 Processing', pc.pendingIceCandidates.length, 'queued ICE candidates for', from);
+      for (const candidate of pc.pendingIceCandidates) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          console.error('❌ Error adding queued ICE candidate:', err);
         }
-      } else {
-        console.warn('⚠️ Unexpected signaling state for', from, ':', pc.signalingState);
       }
-    } else {
-      console.warn('⚠️ No peer connection found for', from, '- creating one');
-      // Create peer connection if it doesn't exist (shouldn't happen normally)
-      await createPeerConnection(from);
+      pc.pendingIceCandidates = [];
     }
   } catch (err) {
-    console.error('❌ Error handling answer from', from, ':', err);
+    console.error('❌ OUTER TRY/CATCH ERROR handling answer from', from, ':', err, 'error name:', err.name);
+  }
+});
+
+socket.on('requestOffer', async ({ from }) => {
+  try {
+    console.log('📨 Received offer request from', from);
+    const pc = peerConnections[from];
+    if (!pc) {
+      console.warn('⚠️ No peer connection with', from, 'to send offer');
+      return;
+    }
+    
+    console.log('  PC signaling state:', pc.signalingState, 'remoteDescription exists?', !!pc.remoteDescription);
+    
+    // Only respond to requestOffer if we're in a stable state
+    // Don't try to create offers while negotiation is happening
+    if (pc.signalingState !== 'stable') {
+      console.log('⏭️ Skipping requestOffer from', from, '- not in stable state');
+      return;
+    }
+    
+    // Only send offer if we have local stream
+    if (localStream) {
+      console.log('📝 Creating offer in response to request from', from);
+      try {
+        const offer = await pc.createOffer();
+        
+        // Double-check state before setting local description (state may have changed during createOffer)
+        if (pc.signalingState !== 'stable') {
+          console.log('⏭️ State changed during createOffer for', from, '- now:', pc.signalingState, '- aborting');
+          return;
+        }
+        
+        await pc.setLocalDescription(offer);
+        socket.emit('offer', { to: from, offer: pc.localDescription });
+        console.log('📤 Sent requested offer to', from);
+      } catch (err) {
+        console.error('❌ Error creating/sending requested offer to', from, ':', err.message);
+      }
+    } else {
+      console.warn('⚠️ Cannot send offer to', from, '- no local stream');
+    }
+  } catch (err) {
+    console.error('❌ Error handling offer request from', from, ':', err);
   }
 });
 
@@ -2076,7 +2419,12 @@ socket.on('ice-candidate', async ({ from, candidate }) => {
         pc.pendingIceCandidates.push(candidate);
       }
     } else if (!pc) {
-      console.warn('⚠️ Received ICE candidate from', from, 'but no peer connection exists');
+      // PC doesn't exist yet - queue this candidate to add when PC is created
+      console.log('⏳ Queuing ICE candidate from', from, '(peer connection not created yet)');
+      if (!pendingIceCandidates[from]) {
+        pendingIceCandidates[from] = [];
+      }
+      pendingIceCandidates[from].push(candidate);
     }
   } catch (err) {
     console.error('❌ Error adding ICE candidate from', from, ':', err);
@@ -2094,6 +2442,10 @@ socket.on('playerStats', ({ playerName, stats }) => {
 // Handle player disconnection - clean up their feed and connection
 socket.on('disconnect', () => {
   console.log('❌ Disconnected from server');
+  
+  // Stop monitoring feeds
+  stopFeedMonitor();
+  
   // Close all peer connections
   Object.keys(peerConnections).forEach(socketId => {
     if (peerConnections[socketId]) {

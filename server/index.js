@@ -915,6 +915,10 @@ if (!firstPlayDone[roomId]) {
     io.to(to).emit('ice-candidate', { from: socket.id, candidate });
   });
 
+  socket.on('requestOffer', ({ to }) => {
+    io.to(to).emit('requestOffer', { from: socket.id });
+  });
+
   socket.on('getPlayerStats', ({ playerName }) => {
     const stats = getOrCreatePlayer(playerName);
     socket.emit('playerStats', { playerName, stats });
