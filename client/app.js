@@ -704,6 +704,10 @@ async function initializeCamera(enableCam = true, enableMic = true) {
                     await pc.setRemoteDescription(offer);
                     console.log('  🔗 Remote description set for pending offer from', from);
                     
+                    // ⚠️ ESSENTIAL: Same transceiver fix as main offer handler (git 3e292d7)
+                    // Must maintain consistency between pending and regular offer handling
+                    // See /memories/repo/WebRTC_3Player_Video_Solution.md
+                    
                     // CRITICAL FIX: Change all recvonly transceivers to sendrecv for the answer
                     const txceivers = pc.getTransceivers();
                     console.log('    🎬 Checking transceivers - total:', txceivers.length);
@@ -1194,8 +1198,10 @@ async function createPeerConnection(remoteSocketId) {
         createPlayerFeed(remoteSocketId, playerName, null, false, isWaiting);
     }
 
-    // Don't pre-create transceivers - they'll be created naturally from offers or from addTrack
-    // This avoids the problem of having unused transceivers [0,1] while answer uses [2,3]
+    // ⚠️ CRITICAL: Do NOT use addTransceiver() here!
+    // This causes transceiver duplication that breaks three-player video.
+    // See git commit 3e292d7 and /memories/repo/WebRTC_3Player_Video_Solution.md
+    // SOLUTION: Use addTrack() instead - creates transceivers naturally with proper direction
     console.log('📡 Peer connection ready for', remoteSocketId);
     
     // Immediately add local stream tracks using addTrack (creates transceivers with proper direction)
@@ -2237,6 +2243,13 @@ socket.on('offer', async ({ from, offer }) => {
     console.log('  🔗 About to set remote description for', from);
     await pc.setRemoteDescription(offer);
     console.log('  🔗 Remote description set');
+    
+    // ⚠️ ESSENTIAL: This section ensures three-player video works!
+    // When setRemoteDescription() is called, browser creates recvonly transceivers for incoming media.
+    // We MUST change them to sendrecv BEFORE createAnswer() is called, otherwise the answer
+    // will have disabled media (port 9, 0.0.0.0) and video won't display for peer pairs.
+    // See git commit 3e292d7 and /memories/repo/WebRTC_3Player_Video_Solution.md
+    // 🚨 DO NOT REMOVE OR MODIFY THIS SECTION 🚨
     
     // CRITICAL FIX: When offer arrives, browser creates recvonly transceivers for incoming media
     // We need to change ALL recvonly transceivers to sendrecv so answer includes our sending tracks
