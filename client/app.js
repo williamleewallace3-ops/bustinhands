@@ -730,7 +730,7 @@ async function initializeCamera(enableCam = true, enableMic = true) {
                                 : localStream.getVideoTracks();
                               
                               if (localTracks.length > 0) {
-                                t.sender.replaceTrack(localTracks[0]);
+                                await t.sender.replaceTrack(localTracks[0]);
                                 console.log(`      ✔️ Assigned ${trackKind} to transceiver[${i}]`);
                               }
                             } catch (err) {
@@ -2323,7 +2323,7 @@ socket.on('offer', async ({ from, offer }) => {
                 : localStream.getVideoTracks();
               
               if (localTracks.length > 0) {
-                t.sender.replaceTrack(localTracks[0]);
+                await t.sender.replaceTrack(localTracks[0]);
                 console.log(`  ✔️ Assigned ${trackKind} track (${localTracks[0].id}) to transceiver[${i}]`);
               }
             } catch (err) {
