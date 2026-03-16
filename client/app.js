@@ -741,9 +741,17 @@ async function initializeCamera(enableCam = true, enableMic = true) {
                     // Create and send answer
                     console.log('📝 Creating answer for pending offer from', from);
                     const answer = await pc.createAnswer();
+                    
+                    // Safety check: verify audio port in answer
+                    const pendingAudioPortMatch = answer.sdp.match(/^m=audio ([0-9]+)/m);
+                    const pendingAudioPort = pendingAudioPortMatch ? pendingAudioPortMatch[1] : 'unknown';
+                    if (pendingAudioPort === '9') {
+                      console.warn('🚨 WARNING: Pending answer SDP has DISABLED audio port (9) for', from);
+                    }
+                    
                     await pc.setLocalDescription(answer);
                     socket.emit('answer', { to: from, answer });
-                    console.log('📤 Sent answer to', from);
+                    console.log('📤 Sent answer to', from, '(audio port:', pendingAudioPort + ')');
                 } catch (err) {
                     console.error('❌ Error processing pending offer from', from, ':', err);
                 }
@@ -1262,8 +1270,27 @@ async function createPeerConnection(remoteSocketId) {
             console.log('⚠️ Connection failed for', remoteSocketId, '- attempting ICE restart');
             // Attempt to restart ICE by creating a new offer with iceRestart
             if (localStream) {
+                // Ensure transceivers are in proper state before ICE restart
+                try {
+                    const txs = peerConnection.getTransceivers();
+                    for (let i = 0; i < txs.length; i++) {
+                        const t = txs[i];
+                        // Make sure any recvonly are changed to sendrecv for restart
+                        if (t.direction === 'recvonly' && t.sender.track) {
+                            t.direction = 'sendrecv';
+                            console.log(`  🔄 [ICE restart] Changed transceiver[${i}] from recvonly to sendrecv`);
+                        }
+                    }
+                } catch (err) {
+                    console.warn('  ⚠️ Error updating transceivers for ICE restart:', err.message);
+                }
+                
                 peerConnection.createOffer({ iceRestart: true })
-                    .then(offer => peerConnection.setLocalDescription(offer))
+                    .then(offer => {
+                        console.log('  📝 ICE restart offer created, audio port:', 
+                            (offer.sdp.match(/^m=audio ([0-9]+)/m) || ['','0'])[1]);
+                        return peerConnection.setLocalDescription(offer);
+                    })
                     .then(() => {
                         socket.emit('offer', {
                             to: remoteSocketId,
@@ -2297,10 +2324,21 @@ socket.on('offer', async ({ from, offer }) => {
     const hasAudioM = answerSDP.includes('m=audio');
     const hasVideoM = answerSDP.includes('m=video');
     const audioRecvLines = (answerSDP.match(/a=recvonly|a=sendrecv/g) || []).length;
-    console.log(`  📋 Answer SDP: audio=${hasAudioM} video=${hasVideoM} recv-capable lines=${audioRecvLines}`);
+    const audioPortMatch = answerSDP.match(/^m=audio ([0-9]+)/m);
+    const audioPort = audioPortMatch ? audioPortMatch[1] : 'unknown';
+    const videoPortMatch = answerSDP.match(/^m=video ([0-9]+)/m);
+    const videoPort = videoPortMatch ? videoPortMatch[1] : 'unknown';
+    
+    console.log(`  📋 Answer SDP: audio=${hasAudioM}(port:${audioPort}) video=${hasVideoM}(port:${videoPort}) recv-capable lines=${audioRecvLines}`);
     console.log('  📋 SDP media lines:', (answerSDP.match(/^m=/gm) || []).length, 'lines');
     console.log('  📋 First 200 chars of SDP:', answerSDP.substring(0, 200));
     console.log('  Answer object type:', answer.type, 'SDP length:', answer.sdp?.length);
+    
+    // SAFETY CHECK: If audio port is disabled (port 9), log warning
+    if (audioPort === '9') {
+      console.warn('🚨 WARNING: Answer SDP has DISABLED audio port (9)! This will break video for', from);
+      console.warn('   Transceivers before answer:', transceivers.map((t, i) => `[${i}]=${t.direction}(sender:${t.sender.track?.kind || 'none'})`).join(' '));
+    }
     
     await pc.setLocalDescription(answer);
     console.log('  ✅ Local description set');
