@@ -704,25 +704,44 @@ async function initializeCamera(enableCam = true, enableMic = true) {
                     await pc.setRemoteDescription(offer);
                     console.log('  🔗 Remote description set for pending offer from', from);
                     
-                    // ⚠️ ESSENTIAL: Same transceiver fix as main offer handler (git 3e292d7)
-                    // Must maintain consistency between pending and regular offer handling
-                    // See /memories/repo/WebRTC_3Player_Video_Solution.md
+                    // ⚠️ ESSENTIAL: Same transceiver fix as main offer handler
+                    // Bind tracks to transceivers to ensure valid answer media ports
                     
-                    // CRITICAL FIX: Change all recvonly transceivers to sendrecv for the answer
                     const txceivers = pc.getTransceivers();
                     console.log('    🎬 Checking transceivers - total:', txceivers.length);
                     
                     try {
                       for (let i = 0; i < txceivers.length; i++) {
                         const t = txceivers[i];
+                        
                         if (t.direction === 'recvonly') {
                           t.direction = 'sendrecv';
                           console.log(`      🔄 Changed transceiver[${i}] from recvonly to sendrecv`);
                         }
+                        
+                        // Bind tracks to ensure createAnswer has valid media
+                        if (localStream) {
+                          const existingTrack = t.sender.track;
+                          if (!existingTrack && i < 2) {
+                            try {
+                              const trackKind = i === 0 ? 'audio' : 'video';
+                              const localTracks = trackKind === 'audio' 
+                                ? localStream.getAudioTracks() 
+                                : localStream.getVideoTracks();
+                              
+                              if (localTracks.length > 0) {
+                                t.sender.replaceTrack(localTracks[0]);
+                                console.log(`      ✔️ Assigned ${trackKind} to transceiver[${i}]`);
+                              }
+                            } catch (err) {
+                              console.warn(`      ⚠️ Error assigning to [${i}]:`, err.message);
+                            }
+                          }
+                        }
                       }
-                      console.log('      ✅ All recvonly transceivers changed to sendrecv');
+                      console.log('      ✅ Transceivers configured');
                     } catch (err) {
-                      console.warn('    ⚠️ Error updating directions:', err.message);
+                      console.warn('    ⚠️ Error managing transceivers:', err.message);
                     }
                     
                     // Process any queued ICE candidates for this connection
@@ -2271,29 +2290,53 @@ socket.on('offer', async ({ from, offer }) => {
     await pc.setRemoteDescription(offer);
     console.log('  🔗 Remote description set');
     
-    // ⚠️ ESSENTIAL: This section ensures three-player video works!
+    // ⚠️ CRITICAL: Transceiver state management for three-player video
     // When setRemoteDescription() is called, browser creates recvonly transceivers for incoming media.
-    // We MUST change them to sendrecv BEFORE createAnswer() is called, otherwise the answer
-    // will have disabled media (port 9, 0.0.0.0) and video won't display for peer pairs.
+    // We MUST: 1) Change them to sendrecv, 2) Bind our local tracks to the right transceivers
+    // Otherwise createAnswer() generates disabled media (port 9, 0.0.0.0).
     // See git commit 3e292d7 and /memories/repo/WebRTC_3Player_Video_Solution.md
     // 🚨 DO NOT REMOVE OR MODIFY THIS SECTION 🚨
     
-    // CRITICAL FIX: When offer arrives, browser creates recvonly transceivers for incoming media
-    // We need to change ALL recvonly transceivers to sendrecv so answer includes our sending tracks
     let transceivers = pc.getTransceivers();
     console.log('  🎬 Checking transceivers after setRemoteDescription - total:', transceivers.length);
     
     try {
       for (let i = 0; i < transceivers.length; i++) {
         const t = transceivers[i];
+        
+        // Change recvonly transceivers to sendrecv
         if (t.direction === 'recvonly') {
           t.direction = 'sendrecv';
           console.log(`  🔄 Changed transceiver[${i}] from recvonly to sendrecv`);
         }
+        
+        // CRITICAL: Bind our local tracks to transceivers that will be used in the answer
+        // This ensures createAnswer() includes our media with valid ports
+        if (localStream) {
+          const existingTrack = t.sender.track;
+          if (!existingTrack && i < 2) {
+            // This transceiver doesn't have a track assigned - assign one
+            try {
+              const trackKind = t.mid === 0 || i === 0 ? 'audio' : 'video';
+              const localTracks = trackKind === 'audio' 
+                ? localStream.getAudioTracks() 
+                : localStream.getVideoTracks();
+              
+              if (localTracks.length > 0) {
+                t.sender.replaceTrack(localTracks[0]);
+                console.log(`  ✔️ Assigned ${trackKind} track (${localTracks[0].id}) to transceiver[${i}]`);
+              }
+            } catch (err) {
+              console.warn(`  ⚠️ Error assigning track to transceiver[${i}]:`, err.message);
+            }
+          } else if (existingTrack) {
+            console.log(`  ℹ️ Transceiver[${i}] already has ${existingTrack.kind} track`);
+          }
+        }
       }
-      console.log('✅ All recvonly transceivers changed to sendrecv');
+      console.log('✅ Transceivers configured for answer');
     } catch (err) {
-      console.warn('  ⚠️ Error updating transceiver directions:', err.message);
+      console.warn('  ⚠️ Error managing transceivers:', err.message);
     }
     
     // Process any queued ICE candidates
