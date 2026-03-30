@@ -71,24 +71,59 @@
 
         <div id="tableArea"></div>
 
-        <!-- VIDEO SIDE PANELS (draggable/resizable) -->
-        <!-- Active Players Panel -->
-        <div id="videoPanel" class="video-panel">
-            <div id="videoPanelHeader" class="video-panel-header">
-                Players
+        <!-- CHAT PANEL (LEFT SIDE) -->
+        <div id="chatPanel" class="chat-panel">
+            <div id="chatPanelHeader" class="chat-panel-header">Chat</div>
+            <div id="chatMessages" class="chat-messages">
+                <!-- Chat messages will be added here -->
             </div>
-            <div id="videoPanelContent" class="video-panel-content">
-                <!-- Active player video feeds will be dynamically added here -->
+            <div class="chat-input-container">
+                <input type="text" id="chatInput" class="chat-input" placeholder="Type @ to mention players...">
+                <button id="emojiBtn" class="chat-emoji-btn" title="Add emoji">😊</button>
+                <button id="chatSendBtn" class="chat-send-btn">Send</button>
+            </div>
+            <!-- Emoji Picker -->
+            <div id="emojiPicker" class="emoji-picker">
+                <div class="emoji-category">
+                    <span class="emoji" data-emoji="😀">😀</span>
+                    <span class="emoji" data-emoji="😂">😂</span>
+                    <span class="emoji" data-emoji="😍">😍</span>
+                    <span class="emoji" data-emoji="🤔">🤔</span>
+                    <span class="emoji" data-emoji="😱">😱</span>
+                    <span class="emoji" data-emoji="👍">👍</span>
+                    <span class="emoji" data-emoji="🖕">🖕</span>
+                    <span class="emoji" data-emoji="🎉">🎉</span>
+                    <span class="emoji" data-emoji="🔥">🔥</span>
+                    <span class="emoji" data-emoji="⭐">⭐</span>
+                    <span class="emoji" data-emoji="💯">💯</span>
+                </div>
+            </div>
+            <!-- @Mention Suggestions -->
+            <div id="mentionSuggestions" class="mention-suggestions">
+                <!-- Player suggestions will be added here -->
             </div>
         </div>
 
-        <!-- Waiting Room Panel -->
-        <div id="waitingPanel" class="video-panel waiting-panel" style="display:none;">
-            <div id="waitingPanelHeader" class="video-panel-header">
-                Waiting Room
+        <!-- PLAYER LIST PANEL (RIGHT SIDE) -->
+        <div id="playerListPanel" class="player-list-panel">
+            <div class="player-list-top">
+                <div id="playerListHeader" class="player-list-header">Players</div>
             </div>
-            <div id="waitingPanelContent" class="video-panel-content">
-                <!-- Waiting room player video feeds will be dynamically added here -->
+            <div id="playerListContent" class="player-list-content">
+                <!-- Player list will be populated here -->
+            </div>
+        </div>
+
+        <!-- STATISTICS DASHBOARD (hidden by default) -->
+        <div id="statsModal" class="stats-modal" style="display:none;">
+            <div class="stats-modal-content">
+                <div class="stats-modal-header">
+                    <h2>Game Statistics</h2>
+                    <button id="closeStatsBtn" class="close-btn">×</button>
+                </div>
+                <div id="statsBody" class="stats-modal-body">
+                    <!-- Stats will be populated here -->
+                </div>
             </div>
         </div>
 
@@ -116,5 +151,6 @@
 
     <script src="/socket.io/socket.io.js"></script>
     <script src="app.js"></script>
+    <script src="enhancements.js"></script>
 </body>
 </html>

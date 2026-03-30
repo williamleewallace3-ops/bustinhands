@@ -83,17 +83,12 @@ socket.on('clearReveals', () => {
 
 let powerTakenTimeout = null;
 
-socket.on('powerTaken', ({ playerId, playerName, cards, card }) => {
-  console.log('🎯 Power taken received:', { playerId, playerName, cards, card });
+socket.on('powerTaken', ({ playerId, playerName, card }) => {
   hasPowerLead = Boolean(mySocketId && playerId === mySocketId);
-  // Support both 'cards' (full hand) and 'card' (single card for backwards compatibility)
-  const cardsToShow = cards || [card] || [{ rank: '2', suit: 'D' }];
-  console.log('Cards to display:', cardsToShow, 'Array?', Array.isArray(cardsToShow));
-  showPowerTakenBanner(playerName, cardsToShow);
+  showPowerTakenBanner(playerName, card || { rank: '2', suit: 'D' });
 });
 
-function showPowerTakenBanner(playerName, cards) {
-  console.log('Creating power taken banner for:', playerName, 'with cards:', cards);
+function showPowerTakenBanner(playerName, card) {
   const existing = document.getElementById('powerTakenBanner');
   if (existing) existing.remove();
   if (powerTakenTimeout) {
@@ -109,25 +104,13 @@ function showPowerTakenBanner(playerName, cards) {
   message.className = 'power-taken-message';
   message.textContent = `${playerName || 'A player'} has taken power`;
 
-  // Create container for cards
-  const cardsContainer = document.createElement('div');
-  cardsContainer.className = 'power-taken-cards-container';
-  
-  // Handle both single card and array of cards
-  const cardsArray = Array.isArray(cards) ? cards : [cards];
-  console.log('cardsArray:', cardsArray, 'length:', cardsArray.length);
-  
-  cardsArray.forEach((card, idx) => {
-    console.log(`Adding card ${idx}:`, card);
-    const cardImage = document.createElement('img');
-    cardImage.className = 'power-taken-card';
-    cardImage.src = `/cards/${cardFileName(card)}`;
-    cardImage.alt = `${card.rank} of ${card.suit}`;
-    cardsContainer.appendChild(cardImage);
-  });
+  const cardImage = document.createElement('img');
+  cardImage.className = 'power-taken-card';
+  cardImage.src = `/cards/${cardFileName(card)}`;
+  cardImage.alt = '2 of diamonds';
 
   banner.appendChild(message);
-  banner.appendChild(cardsContainer);
+  banner.appendChild(cardImage);
   document.body.appendChild(banner);
 
   requestAnimationFrame(() => banner.classList.add('visible'));
@@ -434,12 +417,8 @@ let hasPowerLead = false;
 ================================ */
 let chatMessagesList = []; // array of { playerName, message, timestamp }
 let playerListData = []; // array of player objects with stats
-let waitingPlayers = []; // array of waiting players { socketId, name }
 let activePlayers = []; // socketIds of active players
 let currentPlayerId = null; // socketId of player whose turn it is
-
-// Make playerListData globally accessible for enhancements
-window.playerListData = playerListData;
 
 const SCENE_BACKGROUNDS = {
   'vampire-bar': '/images/table_background.png',
@@ -662,16 +641,6 @@ function updatePlayerList(players, currentTurn) {
     nameEl.className = 'player-name';
     nameEl.innerHTML = `${player.name} <span class="play-order-badge">${['1st', '2nd', '3rd', '4th'][index]}</span>`;
     
-    // Apply custom player color if available
-    if (window.getPlayerColor) {
-      const color = window.getPlayerColor(player.name);
-      nameEl.style.color = color;
-      const badgeEl = nameEl.querySelector('.play-order-badge');
-      if (badgeEl) {
-        badgeEl.style.background = color;
-      }
-    }
-    
     const statsEl = document.createElement('div');
     statsEl.className = 'player-stats';
     
@@ -708,12 +677,6 @@ socket.on('chatMessage', ({ playerName, message }) => {
   chatMessagesList.push({ playerName, message, timestamp: new Date() });
 });
 
-// Listen for mention alerts and play a chime
-socket.on('mentionAlert', ({ mentioner, message }) => {
-  playMentionChime();
-  console.log(`You were mentioned by ${mentioner}`);
-});
-
 /**
  * Receive player list update from server
  * Shows all active players, their order, stats, etc.
@@ -721,125 +684,8 @@ socket.on('mentionAlert', ({ mentioner, message }) => {
 socket.on('playerListUpdate', ({ players, currentTurn }) => {
   console.log('Player list updated:', players);
   playerListData = players;
-  window.playerListData = players; // Keep globally accessible
   currentPlayerId = currentTurn;
   updatePlayerList(players, currentTurn);
-  
-  // Update mention suggestions with current player list
-  if (window.updatePlayerListForMentions) {
-    window.updatePlayerListForMentions(players);
-  }
-  
-  // Assign colors to players
-  if (window.assignPlayerColors) {
-    window.assignPlayerColors(players);
-  }
-});
-
-// Listen for active players list updates (as players join the game)
-socket.on('activePlayersListUpdate', (players) => {
-  if (!playerListContentEl) return;
-  
-  playerListContentEl.innerHTML = '';
-  
-  if (!Array.isArray(players)) return;
-  
-  players.forEach((player, index) => {
-    const playerEl = document.createElement('div');
-    playerEl.className = 'player-item';
-    
-    const nameEl = document.createElement('div');
-    nameEl.className = 'player-name';
-    nameEl.textContent = player.name;
-    
-    // Apply custom player color if available
-    if (window.getPlayerColor) {
-      const color = window.getPlayerColor(player.name);
-      nameEl.style.color = color;
-    }
-    
-    const statsEl = document.createElement('div');
-    statsEl.className = 'player-stats';
-    
-    const winPercent = player.gamesPlayed > 0 
-      ? Math.round((player.wins / player.gamesPlayed) * 100) 
-      : 0;
-    
-    statsEl.innerHTML = `
-      <div class="player-stat-item"><span class="player-stat-label">Wins:</span><span class="player-stat-value">${player.wins || 0}</span></div>
-      <div class="player-stat-item"><span class="player-stat-label">Games:</span><span class="player-stat-value">${player.gamesPlayed || 0}</span></div>
-      <div class="player-stat-item"><span class="player-stat-label">Win%:</span><span class="player-stat-value">${winPercent}%</span></div>
-    `;
-    
-    playerEl.appendChild(nameEl);
-    playerEl.appendChild(statsEl);
-    playerListContentEl.appendChild(playerEl);
-  });
-});
-
-// Listen for waiting players list updates
-socket.on('waitingList', (players) => {
-  waitingPlayers = players || [];
-  
-  // If there's a waiting section already, update it; otherwise append it
-  const existingWaitingSection = playerListContentEl.querySelector('.waiting-section');
-  
-  if (waitingPlayers.length === 0) {
-    // Remove waiting section if no players waiting
-    if (existingWaitingSection) {
-      existingWaitingSection.remove();
-    }
-    return;
-  }
-  
-  if (existingWaitingSection) {
-    // Update existing waiting section
-    const waitingList = existingWaitingSection.querySelector('.waiting-list');
-    waitingList.innerHTML = '';
-    
-    waitingPlayers.forEach(player => {
-      const playerEl = document.createElement('div');
-      playerEl.className = 'waiting-player-item';
-      playerEl.textContent = player.name;
-      
-      // Apply custom player color if available
-      if (window.getPlayerColor) {
-        const color = window.getPlayerColor(player.name);
-        playerEl.style.color = color;
-      }
-      
-      waitingList.appendChild(playerEl);
-    });
-  } else {
-    // Create new waiting section
-    const waitingSection = document.createElement('div');
-    waitingSection.className = 'waiting-section';
-    
-    const waitingHeader = document.createElement('div');
-    waitingHeader.className = 'waiting-header';
-    waitingHeader.textContent = 'Waiting';
-    
-    const waitingList = document.createElement('div');
-    waitingList.className = 'waiting-list';
-    
-    waitingPlayers.forEach(player => {
-      const playerEl = document.createElement('div');
-      playerEl.className = 'waiting-player-item';
-      playerEl.textContent = player.name;
-      
-      // Apply custom player color if available
-      if (window.getPlayerColor) {
-        const color = window.getPlayerColor(player.name);
-        playerEl.style.color = color;
-      }
-      
-      waitingList.appendChild(playerEl);
-    });
-    
-    waitingSection.appendChild(waitingHeader);
-    waitingSection.appendChild(waitingList);
-    playerListContentEl.appendChild(waitingSection);
-  }
 });
 
 /**
@@ -852,18 +698,7 @@ socket.on('gameStart', ({ players, playOrder }) => {
   ).filter(p => p);
   
   playerListData = orderedPlayers;
-  window.playerListData = orderedPlayers; // Keep globally accessible
   updatePlayerList(orderedPlayers, null);
-  
-  // Update mention suggestions with current player list
-  if (window.updatePlayerListForMentions) {
-    window.updatePlayerListForMentions(orderedPlayers);
-  }
-  
-  // Assign colors to players
-  if (window.assignPlayerColors) {
-    window.assignPlayerColors(orderedPlayers);
-  }
 });
 
 /* ===============================
@@ -1257,33 +1092,6 @@ function playTurnChime() {
     o.stop(ctx.currentTime + 0.36);
 
     setTimeout(() => ctx.close(), 500);
-  } catch (e) {
-    // ignore if audio blocked
-  }
-}
-
-function playMentionChime() {
-  try {
-    const AudioCtx = window.AudioContext || window.webkitAudioContext;
-    const ctx = new AudioCtx();
-
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-
-    o.type = 'sine';
-    o.frequency.setValueAtTime(1046, ctx.currentTime); // C6 - higher pitch for mention
-
-    g.gain.setValueAtTime(0.0001, ctx.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.02);
-    g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.25);
-
-    o.connect(g);
-    g.connect(ctx.destination);
-
-    o.start();
-    o.stop(ctx.currentTime + 0.26);
-
-    setTimeout(() => ctx.close(), 400);
   } catch (e) {
     // ignore if audio blocked
   }

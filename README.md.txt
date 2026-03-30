@@ -1,4 +1,4 @@
-# Chinese Poker Web App
+# Chinese Poker - Chat
 
 ## Requirements
 - Node.js installed

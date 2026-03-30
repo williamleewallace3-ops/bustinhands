@@ -4,6 +4,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const path = require('path');
 const { findBestHand, HAND_TYPE_RANK, rankValue, SUIT_RANK } = require('./utils');
+const sfuHandler = require('./sfu');
 const firstPlayDone = {}; // roomId -> true/false
 const app = express();
 const server = http.createServer(app);
@@ -414,6 +415,9 @@ function startGame(roomId) {
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
+  // Register SFU handlers for video coordination
+  sfuHandler(socket, io);
+
   socket.on('joinRoom', ({ playerName, roomId }) => {
     socket.playerName = playerName;
     socket.roomId = roomId;
@@ -462,6 +466,21 @@ io.on('connection', (socket) => {
       name: p.name,
       ready: !!ready[roomId][p.socket.id]
     })));
+    
+    // Emit active players list with stats for the player list panel
+    const activePlayersData = inGame[roomId].map(socketId => {
+      const player = rooms[roomId].find(p => p.socket.id === socketId);
+      if (!player) return null;
+      const stats = playerStats[player.name] || { wins: 0, gamesPlayed: 0 };
+      return {
+        socketId: socketId,
+        name: player.name,
+        wins: stats.wins,
+        gamesPlayed: stats.gamesPlayed,
+        cardsRemaining: 0 // Will be updated during game
+      };
+    }).filter(x => x);
+    io.to(roomId).emit('activePlayersListUpdate', activePlayersData);
     
     // Emit waiting list (only waiting room players)
     const waiting = waitingRoom[roomId].map(sid => {
@@ -829,7 +848,7 @@ if (!firstPlayDone[roomId]) {
       io.to(roomId).emit('powerTaken', {
         playerId: socket.id,
         playerName: socket.playerName || 'A player',
-        card: { rank: '2', suit: 'D' }
+        cards: playedCards
       });
 
       // Clear trick
@@ -972,14 +991,41 @@ if (!firstPlayDone[roomId]) {
     }).filter(x => x);
     io.to(roomId).emit('waitingList', waiting);
   });
-});
 
+  /* ===============================
+     CHAT MESSAGING
+  ================================ */
+  socket.on("chatMessage", ({ playerName, message, roomId }) => {
+    if (!roomId || !message || !message.trim()) return;
+    
+    // Parse @mentions and notify mentioned players
+    const mentionPattern = /@(\w+)/g;
+    let match;
+    const mentionedPlayers = new Set();
+    
+    while ((match = mentionPattern.exec(message)) !== null) {
+      const mentionedName = match[1];
+      mentionedPlayers.add(mentionedName);
+    }
+    
+    // Send mention alerts to mentioned players
+    if (mentionedPlayers.size > 0) {
+      const playersInRoom = rooms[roomId] || [];
+      playersInRoom.forEach(p => {
+        if (mentionedPlayers.has(p.name)) {
+          p.socket.emit('mentionAlert', { mentioner: playerName, message: message.trim() });
+        }
+      });
+    }
+    
+    // Broadcast chat message to all players
+    io.to(roomId).emit("chatMessage", { playerName, message: message.trim() });
+  });
+});
 function advanceTurn(roomId, fromSocketId) {
   const activeIds = inGame[roomId] || [];
   const idx = activeIds.indexOf(fromSocketId);
   if (idx === -1) return;
-
-  // next active player to the left (ready order)
   const nextId = activeIds[(idx + 1) % activeIds.length];
   currentTurn[roomId] = nextId;
   emitTurn(roomId);
