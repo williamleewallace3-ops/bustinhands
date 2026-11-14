@@ -125,20 +125,17 @@ function displayPlayerAtSeat(seatNumber, playerInfo) {
   let position = 'bottom'; // Default for current player
   
   // If this is not the current player, position them around the table in a circle
+  // Only use positions that don't overlap with dealer/table center (avoid 11, 12, 1 o'clock)
   if (playerInfo.id !== mySocketId) {
     // Create circular positions around the table (current player is at bottom center)
-    // Positions go clockwise: bottom-right, right, top-right, top, top-left, left, bottom-left
+    // Positions: bottom-right, right, bottom-left, left (avoiding top)
     const positions = [
-      'bottom-right',   // 0 - 1 seat away clockwise from current
-      'right',          // 1 - 2 o'clock
-      'top-right',      // 2 - 3 o'clock  
-      'top',            // 3 - straight top
-      'top-left',       // 4 - 9 o'clock
-      'left',           // 5 - 10 o'clock
-      'bottom-left',    // 6 - 11 o'clock
-      'bottom',         // 7 - directly behind (6 o'clock, rarely used)
+      'bottom-right',   // 0 - 4-5 o'clock
+      'right',          // 1 - 3 o'clock
+      'bottom-left',    // 2 - 7-8 o'clock
+      'left',           // 3 - 9 o'clock
     ];
-    position = positions[seatNumber % 8];
+    position = positions[seatNumber % 4];
   }
   
   // Create seat element
@@ -643,7 +640,7 @@ function addTexasHoldEmStyles() {
       transform: translateX(-50%); 
     }
     
-    /* Circular positions around the table */
+    /* Side positions only - avoid top where dealer image is */
     .player-seat.seat-bottom-right { 
       bottom: 60px; 
       right: 40px; 
@@ -655,19 +652,8 @@ function addTexasHoldEmStyles() {
       transform: translateY(-50%); 
     }
     
-    .player-seat.seat-top-right { 
-      top: 60px; 
-      right: 40px; 
-    }
-    
-    .player-seat.seat-top { 
-      top: 10px; 
-      left: 50%; 
-      transform: translateX(-50%); 
-    }
-    
-    .player-seat.seat-top-left { 
-      top: 60px; 
+    .player-seat.seat-bottom-left { 
+      bottom: 60px; 
       left: 40px; 
     }
     
@@ -675,17 +661,6 @@ function addTexasHoldEmStyles() {
       left: 10px; 
       top: 50%; 
       transform: translateY(-50%); 
-    }
-    
-    .player-seat.seat-bottom-left { 
-      bottom: 60px; 
-      left: 40px; 
-    }
-    
-    /* Backup position for 8+ players */
-    .player-seat.seat-bottom-far {
-      bottom: 10px;
-      right: 10px;
     }
     
     .player-name {
