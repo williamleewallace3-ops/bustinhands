@@ -166,13 +166,23 @@ function displayPlayerAtSeat(seatNumber, playerInfo) {
  */
 function displayPlayerHoleCards(playerId, cards) {
   const holesCardsDiv = document.getElementById(`hole-cards-${playerId}`);
-  if (!holesCardsDiv) return;
+  if (!holesCardsDiv) {
+    console.warn(`Hole cards container not found for player ${playerId}`);
+    return;
+  }
   
+  console.log(`Displaying ${cards?.length || 0} hole cards for player ${playerId}:`, cards);
   holesCardsDiv.innerHTML = '';
   
-  cards.forEach(card => {
+  if (!cards || !Array.isArray(cards)) {
+    console.warn('Invalid cards data:', cards);
+    return;
+  }
+  
+  cards.forEach((card, index) => {
     const cardEl = createCardElement(card);
     cardEl.classList.add('hole-card');
+    console.log(`Added card ${index}:`, card, '-> Element text:', cardEl.textContent);
     holesCardsDiv.appendChild(cardEl);
   });
 }
@@ -184,12 +194,27 @@ function createCardElement(card) {
   const suitMap = { 'C': '♣', 'D': '♦', 'H': '♥', 'S': '♠' };
   const cardDiv = document.createElement('div');
   cardDiv.className = 'card';
-  const suit = typeof card === 'string' ? card.slice(-1) : card.suit;
-  const rank = typeof card === 'string' ? card.slice(0, -1) : card.rank;
+  
+  // Handle both string and object card formats
+  let suit, rank;
+  if (typeof card === 'string') {
+    suit = card.slice(-1).toUpperCase();
+    rank = card.slice(0, -1);
+  } else if (card && typeof card === 'object') {
+    suit = (card.suit || '').toUpperCase();
+    rank = card.rank || '?';
+  } else {
+    rank = '?';
+    suit = '?';
+  }
+  
   const suitSymbol = suitMap[suit] || suit;
-  cardDiv.textContent = `${rank}${suitSymbol}`;
+  const displayText = `${rank}${suitSymbol}`;
+  
+  cardDiv.textContent = displayText;
   cardDiv.setAttribute('data-rank', rank);
   cardDiv.setAttribute('data-suit', suit);
+  
   return cardDiv;
 }
 
