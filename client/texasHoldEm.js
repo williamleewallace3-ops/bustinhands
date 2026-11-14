@@ -817,8 +817,3 @@ function addTexasHoldEmStyles() {
   
   document.head.appendChild(styleSheet);
 }
-
-// Initialize when needed
-if (selectedGame === 'texasHoldEm') {
-  // Will be called after game starts
-}
