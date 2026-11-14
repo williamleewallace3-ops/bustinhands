@@ -124,18 +124,21 @@ function displayPlayerAtSeat(seatNumber, playerInfo) {
   // Determine position based on whether this is the current player
   let position = 'bottom'; // Default for current player
   
-  // If this is not the current player, position them around the table
+  // If this is not the current player, position them around the table in a circle
   if (playerInfo.id !== mySocketId) {
+    // Create circular positions around the table (current player is at bottom center)
+    // Positions go clockwise: bottom-right, right, top-right, top, top-left, left, bottom-left
     const positions = [
-      'bottom-left',  // 0 - to the left
-      'left',         // 1
-      'top-left',     // 2
-      'top',          // 3
-      'top-right',    // 4
-      'right',        // 5
-      'bottom-right', // 6 - to the right
+      'bottom-right',   // 0 - 1 seat away clockwise from current
+      'right',          // 1 - 2 o'clock
+      'top-right',      // 2 - 3 o'clock  
+      'top',            // 3 - straight top
+      'top-left',       // 4 - 9 o'clock
+      'left',           // 5 - 10 o'clock
+      'bottom-left',    // 6 - 11 o'clock
+      'bottom',         // 7 - directly behind (6 o'clock, rarely used)
     ];
-    position = positions[seatNumber % 7];
+    position = positions[seatNumber % 8];
   }
   
   // Create seat element
@@ -616,7 +619,7 @@ function addTexasHoldEmStyles() {
     
     .player-seat {
       position: absolute;
-      width: 100px;
+      width: 110px;
       text-align: center;
       color: white;
       padding: 10px;
@@ -624,6 +627,7 @@ function addTexasHoldEmStyles() {
       background: rgba(50, 50, 60, 0.8);
       border: 2px solid rgba(255, 255, 255, 0.2);
       transition: all 0.3s ease;
+      font-size: 12px;
     }
     
     .player-seat.current-bettor {
@@ -632,10 +636,57 @@ function addTexasHoldEmStyles() {
       background: rgba(80, 80, 90, 0.9);
     }
     
-    .player-seat.seat-bottom { bottom: 0; left: 50%; transform: translateX(-50%); }
-    .player-seat.seat-right { right: 0; top: 50%; transform: translateY(-50%); }
-    .player-seat.seat-top { top: 0; left: 50%; transform: translateX(-50%); }
-    .player-seat.seat-left { left: 0; top: 50%; transform: translateY(-50%); }
+    /* Current player - bottom center */
+    .player-seat.seat-bottom { 
+      bottom: 10px; 
+      left: 50%; 
+      transform: translateX(-50%); 
+    }
+    
+    /* Circular positions around the table */
+    .player-seat.seat-bottom-right { 
+      bottom: 60px; 
+      right: 40px; 
+    }
+    
+    .player-seat.seat-right { 
+      right: 10px; 
+      top: 50%; 
+      transform: translateY(-50%); 
+    }
+    
+    .player-seat.seat-top-right { 
+      top: 60px; 
+      right: 40px; 
+    }
+    
+    .player-seat.seat-top { 
+      top: 10px; 
+      left: 50%; 
+      transform: translateX(-50%); 
+    }
+    
+    .player-seat.seat-top-left { 
+      top: 60px; 
+      left: 40px; 
+    }
+    
+    .player-seat.seat-left { 
+      left: 10px; 
+      top: 50%; 
+      transform: translateY(-50%); 
+    }
+    
+    .player-seat.seat-bottom-left { 
+      bottom: 60px; 
+      left: 40px; 
+    }
+    
+    /* Backup position for 8+ players */
+    .player-seat.seat-bottom-far {
+      bottom: 10px;
+      right: 10px;
+    }
     
     .player-name {
       font-weight: bold;
@@ -643,12 +694,12 @@ function addTexasHoldEmStyles() {
     }
     
     .player-stack {
-      font-size: 12px;
+      font-size: 11px;
       color: #90EE90;
     }
     
     .player-current-bet {
-      font-size: 11px;
+      font-size: 10px;
       color: #ffaa00;
       margin-top: 3px;
     }
