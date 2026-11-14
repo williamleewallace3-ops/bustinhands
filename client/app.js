@@ -6,7 +6,6 @@ const socket = io();
 let mySocketId = null;
 let lastTurnPlayerId = null;
 let playerStatus = 'loading'; // 'active' or 'waiting'
-let myOwnStats = null; // Store own stats until camera feed is created
 
 socket.on('connect', () => {
   mySocketId = socket.id;
@@ -38,14 +37,6 @@ socket.on('playerStatus', ({ status, queuePosition, stats }) => {
   }
 
   updateInGameHeaderVisibility();
-  
-  // Store stats and update feed if it exists
-  if (stats) {
-    myOwnStats = stats;
-    if (mySocketId && playerFeeds[mySocketId]) {
-      updatePlayerFeedStats(mySocketId, stats);
-    }
-  }
 });
 
 socket.on('playAccepted', ({ playedCards }) => {
@@ -357,10 +348,6 @@ function displayRevealedHand(socketId, playerName, cards) {
   
   // Reset feed order flag so they can be reordered for next game
   feedsOrderedThisGame = false;
-  
-  // NOTE: DO NOT reset playerNames, playerFeeds, or peerConnections here
-  // These are needed to maintain video feeds across game restarts
-  // Players remain connected and their feeds should persist
 }
 
 /* ===============================
@@ -420,24 +407,28 @@ let draggingEl = null;
 let placeholder = null;
 let selectedScene = 'vampire-bar'; // default scene
 let selectedDeck = '1'; // default deck
+let selectedGame = 'chinesePoker'; // default game ('chinesePoker' or 'texasHoldEm')
 let isMyTurn = false;
 let currentTrickCardCount = null;
 let hasPowerLead = false;
 
 /* ===============================
-   WEBRTC & VIDEO STATE
+   WEBRTC & VIDEO STATE (SFU COORDINATED)
 ================================ */
 let localStream = null;
-let peerConnections = {}; // socketId -> RTCPeerConnection
-let dataChannels = {}; // socketId -> RTCDataChannel
-let remoteStreams = {}; // socketId -> MediaStream used for accumulating tracks when event.streams is empty
-let playerLayout = {}; // socketId -> window position (topLeft, topRight, bottomLeft, bottomRight)
-let playerStats = {}; // socketId -> { name, wins, gamesPlayed, winPercent, cardsRemaining }
+let peerConnections = {}; // socketId → RTCPeerConnection (simplified peer setup via SFU coordination)
+let dataChannels = {}; // socketId → RTCDataChannel
+let remoteStreams = {}; // socketId → MediaStream used for accumulating tracks
+let playerLayout = {}; // socketId → window position (topLeft, topRight, bottomLeft, bottomRight)
+let playerStats = {}; // socketId → { name, wins, gamesPlayed, winPercent, cardsRemaining }
 let activePlayer = null; // socketId of player whose turn it is
-let pendingOffers = []; // Queue of offers to handle after camera is ready
-let pendingIceCandidates = {}; // socketId -> array of ICE candidates to add when PC is created
-let feedMonitorInterval = null; // Interval for checking/retrying missing feeds
-let lastRenegotiationAttempt = {}; // Track when we last tried to renegotiate with each peer
+
+// SFU-specific state (much simpler than mesh)
+let readyToConnect = false; // camera initialized
+let pendingPeerOffers = {}; // socketId → offer (from server relay)
+let pendingPeerAnswers = {}; // socketId → answer (from server relay, queued until peer connection ready)
+let pendingIceCandidates = {}; // socketId → [candidates] (queued until remote description exists)
+let processingSignaling = {}; // socketId → boolean (lock to prevent concurrent signaling operations)
 
 const ICE_SERVERS = {
   iceServers: [
@@ -538,13 +529,34 @@ joinBtn.addEventListener('click', () => {
     playerName = document.getElementById('playerName').value.trim();
     if (!playerName) return alert("Enter your name");
 
-    // Show scene selection instead of going directly to game
+    // Show game selection
     const lobbyOverlay = document.getElementById('lobbyOverlay');
-    const sceneOverlay = document.getElementById('sceneOverlay');
+    const gameSelectOverlay = document.getElementById('gameSelectOverlay');
     
     lobbyOverlay.style.display = 'none';
-    sceneOverlay.style.display = 'flex';
+    gameSelectOverlay.style.display = 'flex';
 });
+
+/* ===============================
+   GAME SELECTION
+================================ */
+const chinesePokerBtn = document.getElementById('chinesePokerBtn');
+const texasHoldEmBtn = document.getElementById('texasHoldEmBtn');
+
+chinesePokerBtn.addEventListener('click', () => {
+    selectedGame = 'chinesePoker';
+    showSceneSelection();
+});
+
+texasHoldEmBtn.addEventListener('click', () => {
+    selectedGame = 'texasHoldEm';
+    showSceneSelection();
+});
+
+function showSceneSelection() {
+  document.getElementById('gameSelectOverlay').style.display = 'none';
+  document.getElementById('sceneOverlay').style.display = 'flex';
+}
 
 /* ===============================
    SCENE SELECTION
@@ -600,7 +612,7 @@ function startGame(scene) {
     const defaultRoomId = 'mainRoom';
     roomId = defaultRoomId;
     
-    socket.emit('joinRoom', { playerName, roomId: defaultRoomId });
+    socket.emit('joinRoom', { playerName, roomId: defaultRoomId, gameType: selectedGame });
 
     applyScene(scene);
     initializeInGameOptions();
@@ -611,11 +623,12 @@ function startGame(scene) {
     if (roomLabel) roomLabel.textContent = 'Main Game';
     updateInGameHeaderVisibility();
     
-    // Open video panel in a separate window by default
-    openVideoPanelWindow();
-
-    // Initialize camera/microphone - browser will prompt for permissions
-    initializeCamera();
+    // Initialize game-specific UI
+    if (selectedGame === 'texasHoldEm') {
+      initializeTexasHoldEmUI();
+    }
+    
+    // Video functionality disabled
 }
 
 /* ===============================
@@ -678,164 +691,183 @@ async function initializeCamera(enableCam = true, enableMic = true) {
             updatePlayerFeedStats(mySocketId, myOwnStats);
         }
         
-        // FIRST: Handle any offers that came in before camera was ready
-        // This ensures we respond to their offers before creating our own
-        if (pendingOffers.length > 0) {
-            console.log('📨 Processing', pendingOffers.length, 'pending offers now that camera is ready');
-            const offersToProcess = pendingOffers.splice(0); // Get all pending offers
-            for (const { from, offer } of offersToProcess) {
-                try {
-                    // Create peer connection or reuse existing
-                    const pc = await createPeerConnection(from);
-                    const isPolite = mySocketId > from;
-                    
-                    // If we have a local offer already, handle collision
-                    if (pc.signalingState === 'have-local-offer') {
-                        if (isPolite) {
-                            console.log('⚠️ Pending offer collision with', from, '- rolling back (polite)');
-                            await pc.setLocalDescription({ type: 'rollback' });
-                        } else {
-                            console.log('⚠️ Pending offer collision with', from, '- we stay impolite, ignore theirs');
-                            continue;
-                        }
-                    }
-                    
-                    // Set their offer as remote description
-                    await pc.setRemoteDescription(offer);
-                    console.log('  🔗 Remote description set for pending offer from', from);
-                    
-                    // ⚠️ ESSENTIAL: Same transceiver fix as main offer handler
-                    // Bind tracks to transceivers to ensure valid answer media ports
-                    
-                    const txceivers = pc.getTransceivers();
-                    console.log('    🎬 Checking transceivers - total:', txceivers.length);
-                    
-                    try {
-                      for (let i = 0; i < txceivers.length; i++) {
-                        const t = txceivers[i];
-                        
-                        if (t.direction === 'recvonly') {
-                          t.direction = 'sendrecv';
-                          console.log(`      🔄 Changed transceiver[${i}] from recvonly to sendrecv`);
-                        }
-                        
-                        // Bind tracks to ensure createAnswer has valid media
-                        if (localStream) {
-                          const existingTrack = t.sender.track;
-                          if (!existingTrack && i < 2) {
-                            try {
-                              const trackKind = i === 0 ? 'audio' : 'video';
-                              const localTracks = trackKind === 'audio' 
-                                ? localStream.getAudioTracks() 
-                                : localStream.getVideoTracks();
-                              
-                              if (localTracks.length > 0) {
-                                await t.sender.replaceTrack(localTracks[0]);
-                                console.log(`      ✔️ Assigned ${trackKind} to transceiver[${i}]`);
-                              }
-                            } catch (err) {
-                              console.warn(`      ⚠️ Error assigning to [${i}]:`, err.message);
-                            }
-                          }
-                        }
-                      }
-                      console.log('      ✅ Transceivers configured');
-                    } catch (err) {
-                      console.warn('    ⚠️ Error managing transceivers:', err.message);
-                    }
-                    
-                    // Process any queued ICE candidates for this connection
-                    if (pc.pendingIceCandidates && pc.pendingIceCandidates.length > 0) {
-                        console.log('📥 Processing', pc.pendingIceCandidates.length, 'queued ICE candidates for', from);
-                        for (const candidate of pc.pendingIceCandidates) {
-                            try {
-                                await pc.addIceCandidate(new RTCIceCandidate(candidate));
-                            } catch (err) {
-                                console.error('❌ Error adding ICE candidate:', err);
-                            }
-                        }
-                        pc.pendingIceCandidates = [];
-                    }
-                    
-                    // Create and send answer
-                    console.log('📝 Creating answer for pending offer from', from);
-                    const answer = await pc.createAnswer();
-                    
-                    // Safety check: verify audio port in answer
-                    const pendingAudioPortMatch = answer.sdp.match(/^m=audio ([0-9]+)/m);
-                    const pendingAudioPort = pendingAudioPortMatch ? pendingAudioPortMatch[1] : 'unknown';
-                    if (pendingAudioPort === '9') {
-                      console.warn('🚨 WARNING: Pending answer SDP has DISABLED audio port (9) for', from);
-                    }
-                    
-                    await pc.setLocalDescription(answer);
-                    socket.emit('answer', { to: from, answer });
-                    console.log('📤 Sent answer to', from, '(audio port:', pendingAudioPort + ')');
-                } catch (err) {
-                    console.error('❌ Error processing pending offer from', from, ':', err);
-                }
-            }
-        }
+        // Notify server we're ready with camera
+        socket.emit('joinGameSFU', { roomId, playerName });
+        readyToConnect = true;
         
-        // SECOND: Create peer connections with players who joined before camera was ready
-        // For players we haven't already connected to via pending offers
+        // Create peer connections with any existing players
         const existingPlayerIds = Object.keys(playerNames).filter(id => id !== mySocketId);
         for (const playerId of existingPlayerIds) {
             if (!peerConnections[playerId]) {
-                console.log('📞 Creating new peer connection after camera init:', playerId);
-                await createPeerConnectionAndOffer(playerId);
-            } else {
-                console.log('✅ Already have connection with', playerId, 'from pending offer response');
+                console.log('📞 Creating peer connection after camera init:', playerId);
+                await setupPeerConnection(playerId);
             }
         }
         
-        // Add tracks to ALL existing peer connections
-        for (const socketId of Object.keys(peerConnections)) {
-            const pc = peerConnections[socketId];
-            if (!pc) continue;
-
-            const transceivers = pc.getTransceivers();
-            localStream.getAudioTracks().forEach(track => {
-                if (transceivers[0] && !transceivers[0].sender.track) {
-                    console.log('🔄 Adding audio track to transceiver for peer connection:', socketId);
-                    transceivers[0].sender.replaceTrack(track);
-                }
-            });
-            localStream.getVideoTracks().forEach(track => {
-                if (transceivers[1] && !transceivers[1].sender.track) {
-                    console.log('🔄 Adding video track to transceiver for peer connection:', socketId);
-                    transceivers[1].sender.replaceTrack(track);
-                }
-            });
-        }
+        // Process any queued offers and answers now that camera is ready and peer connections exist
+        await processQueuedSignaling();
         
-        // Renegotiate for connections that are stable to send tracks
-        for (const socketId of Object.keys(peerConnections)) {
-            const pc = peerConnections[socketId];
-            if (pc && pc.signalingState === 'stable' && pc.localDescription && pc.remoteDescription) {
-                pc.createOffer().then(offer => {
-                    return pc.setLocalDescription(offer);
-                }).then(() => {
-                    socket.emit('offer', { to: socketId, offer: pc.localDescription });
-                    console.log('📤 Sent renegotiation offer to', socketId);
-                }).catch(err => console.error('Renegotiation failed:', err));
-            }
-        }
+        // Start feed monitoring (simpler than before)
+        monitorFeeds();
         
-        // Request fresh offers from all existing players to ensure we get their video feeds
-        console.log('🔄 Requesting fresh offers from all existing players');
-        for (const socketId of Object.keys(peerConnections)) {
-            if (socketId !== mySocketId) {
-                console.log('  📨 Requesting offer from', socketId);
-                socket.emit('requestOffer', { to: socketId });
-            }
-        }
-        
-        // Start monitoring feeds for failures and retrying
-        startFeedMonitor();
     } catch (err) {
         console.error('❌ Error accessing camera/mic:', err);
         alert('Could not access camera or microphone. Video features disabled.');
+    }
+}
+
+/**
+ * Setup peer connection with another player
+ * Simpler than old createPeerConnectionAndOffer - no complex offer/answer dance
+ */
+async function setupPeerConnection(remoteSocketId) {
+    if (peerConnections[remoteSocketId]) {
+        console.log('♻️ Peer connection already exists for', remoteSocketId.substring(0,6));
+        return;
+    }
+    
+    if (!localStream) {
+        console.log('⏳ No local stream yet, skipping setup for', remoteSocketId);
+        return;
+    }
+    
+    try {
+        // CRITICAL: Only send offers from the peer with LOWER socketId
+        // This prevents collision where both peers try to send offers simultaneously
+        const shouldInitiate = mySocketId < remoteSocketId;
+        
+        if (!shouldInitiate) {
+            console.log('⏳ Waiting for offer from', remoteSocketId, '(they have lower ID:', mySocketId, '<', remoteSocketId, ')');
+            // Still create the PC, but don't send offer - wait for theirs
+            await createPeerConnection(remoteSocketId);
+            return;
+        }
+        
+        console.log('🎤 I have lower ID, sending offer to', remoteSocketId, '(', mySocketId, '<', remoteSocketId, ')');
+        const pc = await createPeerConnection(remoteSocketId);
+        console.log('   Creating offer...');
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        
+        // Send offer via SFU coordination
+        console.log('   Emitting sfuOffer...');
+        socket.emit('sfuOffer', {
+            roomId,
+            offer: pc.localDescription
+        });
+        console.log('📤 ✅ SFU offer emitted to', remoteSocketId);
+    } catch (err) {
+        console.error('❌ Error setting up peer connection:', err.name, '-', err.message);
+    }
+}
+
+/**
+ * Process any offers and answers that were queued while camera was initializing
+ * This ensures waiting room players who receive offers before their camera is ready
+ * will still establish connections after camera initialization
+ */
+async function processQueuedSignaling() {
+    console.log('🔄 Processing queued signaling...');
+    
+    // Process queued offers
+    const queuedOfferIds = Object.keys(pendingPeerOffers);
+    if (queuedOfferIds.length > 0) {
+        console.log(`   Processing ${queuedOfferIds.length} queued offers`);
+        for (const fromId of queuedOfferIds) {
+            const offer = pendingPeerOffers[fromId];
+            console.log(`   📨 Processing queued offer from ${fromId.substring(0,6)}`);
+            delete pendingPeerOffers[fromId];
+            
+            // Re-trigger the offer handler logic
+            if (!peerConnections[fromId]) {
+                console.log(`      Creating peer connection first for ${fromId.substring(0,6)}`);
+                await createPeerConnection(fromId);
+            }
+            
+            // Process the offer
+            try {
+                if (fromId > mySocketId) {
+                    console.log(`   ⚠️ COLLISION: Queued offer from ${fromId.substring(0,6)} has higher ID, ignoring`);
+                    continue;
+                }
+                
+                const pc = peerConnections[fromId];
+                if (pc.remoteDescription) {
+                    console.log(`   ⏭️ Already have remote description for ${fromId.substring(0,6)}, skipping`);
+                    continue;
+                }
+                
+                await pc.setRemoteDescription(offer);
+                console.log(`   ✅ Remote description set from queued offer`);
+                
+                // Process any queued ICE candidates for this peer
+                if (pendingIceCandidates[fromId]) {
+                    console.log(`   📤 Processing ${pendingIceCandidates[fromId].length} queued ICE candidates`);
+                    for (const candidate of pendingIceCandidates[fromId]) {
+                        try {
+                            await pc.addIceCandidate(candidate);
+                        } catch (e) {
+                            if (e.name !== 'OperationError') console.error('   ❌ Error adding candidate:', e.name);
+                        }
+                    }
+                    delete pendingIceCandidates[fromId];
+                }
+                
+                // Create and send answer
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                socket.emit('sfuAnswer', { to: fromId, answer: pc.localDescription });
+                console.log(`   📤 Sent answer to ${fromId.substring(0,6)}`);
+            } catch (err) {
+                console.error(`   ❌ Error processing queued offer from ${fromId}:`, err.message);
+            }
+        }
+    }
+    
+    // Process queued answers
+    const queuedAnswerIds = Object.keys(pendingPeerAnswers);
+    if (queuedAnswerIds.length > 0) {
+        console.log(`   Processing ${queuedAnswerIds.length} queued answers`);
+        for (const fromId of queuedAnswerIds) {
+            const answer = pendingPeerAnswers[fromId];
+            console.log(`   📨 Processing queued answer from ${fromId.substring(0,6)}`);
+            delete pendingPeerAnswers[fromId];
+            
+            try {
+                const pc = peerConnections[fromId];
+                if (!pc) {
+                    console.warn(`   ❌ No peer connection for ${fromId}`);
+                    continue;
+                }
+                
+                if (pc.signalingState !== 'have-local-offer') {
+                    console.log(`   ⏭️ Not expecting answer (state: ${pc.signalingState}), skipping`);
+                    continue;
+                }
+                
+                await pc.setRemoteDescription(answer);
+                console.log(`   ✅ Remote description set from queued answer`);
+                
+                // Process any queued ICE candidates
+                if (pendingIceCandidates[fromId] && pendingIceCandidates[fromId].length > 0) {
+                    console.log(`   📤 Processing ${pendingIceCandidates[fromId].length} queued ICE candidates`);
+                    for (const candidate of pendingIceCandidates[fromId]) {
+                        try {
+                            await pc.addIceCandidate(candidate);
+                        } catch (e) {
+                            if (e.name !== 'OperationError') console.error('   ❌ Error adding candidate:', e.name);
+                        }
+                    }
+                    delete pendingIceCandidates[fromId];
+                }
+            } catch (err) {
+                console.error(`   ❌ Error processing queued answer from ${fromId}:`, err.message);
+            }
+        }
+    }
+    
+    if (queuedOfferIds.length === 0 && queuedAnswerIds.length === 0) {
+        console.log('   ℹ️ No queued signaling to process');
     }
 }
 
@@ -1206,8 +1238,13 @@ window.addEventListener('DOMContentLoaded', () => {
 });
 
 /* ===============================
-   WEBRTC HELPERS
+   WEBRTC HELPERS - SFU COORDINATED
 ================================ */
+
+/**
+ * Create or get peer connection with another player
+ * SFU coordinates who connects to whom
+ */
 async function createPeerConnection(remoteSocketId) {
     if (peerConnections[remoteSocketId]) {
         console.log('♻️ Reusing existing peer connection for', remoteSocketId);
@@ -1225,19 +1262,12 @@ async function createPeerConnection(remoteSocketId) {
         createPlayerFeed(remoteSocketId, playerName, null, false, isWaiting);
     }
 
-    // ⚠️ CRITICAL: Do NOT use addTransceiver() here!
-    // This causes transceiver duplication that breaks three-player video.
-    // See git commit 3e292d7 and /memories/repo/WebRTC_3Player_Video_Solution.md
-    // SOLUTION: Use addTrack() instead - creates transceivers naturally with proper direction
-    console.log('📡 Peer connection ready for', remoteSocketId);
-    
-    // Immediately add local stream tracks using addTrack (creates transceivers with proper direction)
+    // Add our local stream tracks
     if (localStream) {
-        console.log('🎬 Adding local stream tracks to', remoteSocketId, '- using addTrack');
+        console.log('🎬 Adding local stream tracks to', remoteSocketId);
         let audioAdded = false, videoAdded = false;
         
         localStream.getAudioTracks().forEach(track => {
-            console.log('  🔊 Audio track:', track.id, 'enabled:', track.enabled);
             if (!audioAdded) {
                 console.log('  ➕ Adding audio via addTrack');
                 peerConnection.addTrack(track, localStream);
@@ -1246,7 +1276,6 @@ async function createPeerConnection(remoteSocketId) {
         });
         
         localStream.getVideoTracks().forEach(track => {
-            console.log('  📹 Video track:', track.id, 'enabled:', track.enabled);
             if (!videoAdded) {
                 console.log('  ➕ Adding video via addTrack');
                 peerConnection.addTrack(track, localStream);
@@ -1254,23 +1283,17 @@ async function createPeerConnection(remoteSocketId) {
             }
         });
         
-        console.log('✅ Tracks added - audio:', audioAdded, 'video:', videoAdded);
-    } else {
-        console.log('⚠️ NO localStream available for', remoteSocketId, '- tracks cannot be sent!');
+        console.log('✅ Tracks added to peer connection');
     }
     
     // Handle remote stream
     peerConnection.ontrack = (event) => {
         console.log('✅ Received remote track from', remoteSocketId, '- kind:', event.track.kind);
-        console.log('Remote streams:', event.streams);
 
         let streamToUse;
         if (event.streams && event.streams.length > 0) {
             streamToUse = event.streams[0];
         } else {
-            // No stream array provided.  We may get separate ontrack events for
-            // video and audio, so stash them in a persistent MediaStream so we
-            // don't replace the video with an audio-only stream or vice versa.
             if (!remoteStreams[remoteSocketId]) {
                 remoteStreams[remoteSocketId] = new MediaStream();
             }
@@ -1283,55 +1306,40 @@ async function createPeerConnection(remoteSocketId) {
     };
 
     // Handle connection state changes
+    let reconnectAttempt = 0;
     peerConnection.onconnectionstatechange = () => {
         console.log('Connection state for', remoteSocketId, ':', peerConnection.connectionState);
         if (peerConnection.connectionState === 'failed') {
-            console.log('⚠️ Connection failed for', remoteSocketId, '- attempting ICE restart');
-            // Attempt to restart ICE by creating a new offer with iceRestart
-            if (localStream) {
-                // Ensure transceivers are in proper state before ICE restart
-                try {
-                    const txs = peerConnection.getTransceivers();
-                    for (let i = 0; i < txs.length; i++) {
-                        const t = txs[i];
-                        // Make sure any recvonly are changed to sendrecv for restart
-                        if (t.direction === 'recvonly' && t.sender.track) {
-                            t.direction = 'sendrecv';
-                            console.log(`  🔄 [ICE restart] Changed transceiver[${i}] from recvonly to sendrecv`);
-                        }
-                    }
-                } catch (err) {
-                    console.warn('  ⚠️ Error updating transceivers for ICE restart:', err.message);
-                }
-                
-                peerConnection.createOffer({ iceRestart: true })
-                    .then(offer => {
-                        console.log('  📝 ICE restart offer created, audio port:', 
-                            (offer.sdp.match(/^m=audio ([0-9]+)/m) || ['','0'])[1]);
-                        return peerConnection.setLocalDescription(offer);
-                    })
-                    .then(() => {
-                        socket.emit('offer', {
-                            to: remoteSocketId,
-                            offer: peerConnection.localDescription
-                        });
-                        console.log('📤 Sent ICE restart offer to', remoteSocketId);
-                    })
-                    .catch(err => console.error('❌ ICE restart failed:', err));
+            reconnectAttempt++;
+            if (reconnectAttempt > 3) {
+                console.log('⚠️ Too many reconnection attempts for', remoteSocketId, '- giving up');
+                return;
             }
+            console.log('⚠️ Connection failed for', remoteSocketId, '- reconnection attempt', reconnectAttempt);
+            if (localStream) {
+                // Small delay before reconnect to avoid thrashing
+                setTimeout(() => {
+                    peerConnection.createOffer({ iceRestart: true })
+                        .then(offer => peerConnection.setLocalDescription(offer))
+                        .then(() => {
+                            socket.emit('sfuOffer', {
+                                roomId: roomId,
+                                offer: peerConnection.localDescription
+                            });
+                            console.log('📤 Sent reconnection offer (attempt', reconnectAttempt, ')');
+                        })
+                        .catch(err => console.error('❌ Reconnection failed:', err.name, '-', err.message));
+                }, 500 * reconnectAttempt); // 500ms, 1s, 1.5s delays
+            }
+        } else if (peerConnection.connectionState === 'connected') {
+            reconnectAttempt = 0; // Reset on successful connection
         }
     };
     
-    peerConnection.oniceconnectionstatechange = () => {
-        console.log('ICE connection state for', remoteSocketId, ':', peerConnection.iceConnectionState);
-        if (peerConnection.iceConnectionState === 'failed') {
-            console.log('⚠️ ICE connection failed for', remoteSocketId);
-        }
-    };
     peerConnection.onicecandidate = (event) => {
         if (event.candidate) {
-            console.log('📤 Sending ICE candidate to', remoteSocketId, ':', event.candidate.candidate.substring(0, 50) + '...');
-            socket.emit('ice-candidate', {
+            console.log('📤 Sending ICE candidate to', remoteSocketId);
+            socket.emit('sfuIceCandidate', {
                 to: remoteSocketId,
                 candidate: event.candidate
             });
@@ -1340,104 +1348,32 @@ async function createPeerConnection(remoteSocketId) {
         }
     };
     
-    // Apply any ICE candidates that arrived before this connection was created
-    if (pendingIceCandidates[remoteSocketId] && pendingIceCandidates[remoteSocketId].length > 0) {
-        console.log('📥 Applying', pendingIceCandidates[remoteSocketId].length, 'pending ICE candidates to', remoteSocketId);
-        // Queue them on the new connection to be added when remote description is set
-        if (!peerConnection.pendingIceCandidates) {
-            peerConnection.pendingIceCandidates = [];
-        }
-        peerConnection.pendingIceCandidates.push(...pendingIceCandidates[remoteSocketId]);
-        pendingIceCandidates[remoteSocketId] = []; // Clear the global queue
-    }
-    
     return peerConnection;
 }
 
 /* ===============================
-   FEED MONITORING & RETRY SYSTEM
+   FEED MONITORING & RETRY - SIMPLIFIED FOR SFU
 ================================ */
-function startFeedMonitor() {
-    // Stop any existing monitor
-    if (feedMonitorInterval) {
-        clearInterval(feedMonitorInterval);
-    }
-    
-    // Check feeds every 2 seconds
-    feedMonitorInterval = setInterval(() => {
-        monitorAndRetryFeeds();
-    }, 2000);
-    
-    console.log('📡 Feed monitor started (checking every 2s)');
-}
-
-function stopFeedMonitor() {
-    if (feedMonitorInterval) {
-        clearInterval(feedMonitorInterval);
-        feedMonitorInterval = null;
-        console.log('🛑 Feed monitor stopped');
-    }
-}
-
-function monitorAndRetryFeeds() {
-    const now = Date.now();
-    const RENEGOTIATION_COOLDOWN = 8000; // Wait at least 8 seconds between renegotiation attempts
-    const MAX_RENEGOTIATION_ATTEMPTS = 1; // Only retry once before giving up
-    
-    for (const socketId of Object.keys(peerConnections)) {
-        const pc = peerConnections[socketId];
-        if (!pc || (pc.connectionState !== 'connected' && pc.iceConnectionState !== 'connected')) {
-            continue; // Skip if connection isn't in a good state
-        }
-        
-        // Check if this peer's video feed has video tracks
-        const feed = playerFeeds[socketId];
-        if (!feed) continue;
-        
-        const stream = feed.video?.srcObject;
-        const hasVideo = stream && stream.getVideoTracks && stream.getVideoTracks().length > 0;
-        
-        // If we have video, mark this peer as complete and stop retrying
-        if (hasVideo) {
-            if (lastRenegotiationAttempt[socketId] !== 'complete') {
-                console.log('✅ Confirmed video feed from', socketId, '- stopping retry monitoring');
-                lastRenegotiationAttempt[socketId] = 'complete';
+function monitorFeeds() {
+    // Simple check every 3 seconds to verify feeds are connected
+    setInterval(() => {
+        let missingFeeds = [];
+        for (const [socketId, feed] of Object.entries(playerFeeds)) {
+            if (socketId === mySocketId) continue; // skip own feed
+            
+            const hasVideo = feed.video?.srcObject?.getVideoTracks?.().length > 0;
+            if (!hasVideo && peerConnections[socketId]?.connectionState === 'failed') {
+                missingFeeds.push(socketId);
             }
-            continue; // Don't retry peers with video
         }
         
-        // Skip if we've already marked this as complete
-        if (lastRenegotiationAttempt[socketId] === 'complete') {
-            continue;
+        if (missingFeeds.length > 0) {
+            console.log('⚠️ Missing feeds from:', missingFeeds, '- requesting fresh offers');
+            missingFeeds.forEach(socketId => {
+                socket.emit('sfuRequestOffer', { from: socketId });
+            });
         }
-        
-        const lastAttempt = lastRenegotiationAttempt[socketId] || 0;
-        
-        // Only try renegotiation once, after a delay
-        if (typeof lastAttempt === 'number' && now - lastAttempt < RENEGOTIATION_COOLDOWN) {
-            continue; // Too soon to retry
-        }
-        
-        // Try renegotiation only once
-        if (!lastRenegotiationAttempt[socketId]) {
-            console.log('🔄 Missing video for', socketId, '- attempting renegotiation (attempt 1/' + MAX_RENEGOTIATION_ATTEMPTS + ')');
-            lastRenegotiationAttempt[socketId] = now;
-                
-                // Request new offer from remote peer
-                socket.emit('requestOffer', { to: socketId });
-                
-                // Also try creating new offer ourselves if stable
-                if (pc.signalingState === 'stable' && pc.localDescription && pc.remoteDescription) {
-                    pc.createOffer()
-                        .then(offer => pc.setLocalDescription(offer))
-                        .then(() => {
-                            socket.emit('offer', { to: socketId, offer: pc.localDescription });
-                            console.log('📤 Sent renegotiation offer to', socketId);
-                        })
-                        .catch(err => console.warn('⚠️ Renegotiation offer failed for', socketId, ':', err));
-                }
-        }
-    }
+    }, 3000);
 }
 
 function displayRemoteStream(remoteSocketId, stream) {
@@ -1458,8 +1394,13 @@ function displayRemoteStream(remoteSocketId, stream) {
         // Update existing feed with new stream
         const feed = playerFeeds[remoteSocketId];
         if (feed.video) {
-            feed.video.srcObject = stream;
-            feed.video.play().catch(err => console.warn('⚠️ Video play failed for', remoteSocketId, ':', err));
+            // Only update if stream has actually changed
+            if (feed.video.srcObject !== stream) {
+                feed.video.srcObject = stream;
+                // Pause before playing to avoid interrupt errors
+                feed.video.pause();
+                feed.video.play().catch(err => console.warn('⚠️ Video play failed for', remoteSocketId, ':', err.name));
+            }
         }
         // Update name if we now have it
         if (playerNames[remoteSocketId] && feed.nameDiv) {
@@ -1778,7 +1719,11 @@ socket.on('hideDiscard', () => {
    READY BUTTON
 ================================ */
 readyBtn.addEventListener('click', () => {
-    socket.emit('playerReady');
+    if (selectedGame === 'texasHoldEm') {
+      socket.emit('texasHoldEmReady', { roomId });
+    } else {
+      socket.emit('playerReady');
+    }
 
     // Hide Ready button after clicking
     readyBtn.style.display = 'none';
@@ -2116,10 +2061,10 @@ socket.on('waitingList', (waiting) => {
           // Update feed name if it exists
           updatePlayerFeedName(player.socketId, player.name);
         } else {
-          // No feed exists for this waiting player - create peer connection if we don't have one
-          if (!peerConnections[player.socketId] && localStream) {
-            console.log('📞 Creating peer connection with waiting player:', player.socketId);
-            await createPeerConnectionAndOffer(player.socketId);
+          // No feed exists for this waiting player - setup peer connection
+          if (!peerConnections[player.socketId] && localStream && readyToConnect) {
+            console.log('👥 Setting up SFU connection with waiting player:', player.socketId);
+            await setupPeerConnection(player.socketId);
           }
         }
       }
@@ -2149,28 +2094,42 @@ socket.on('existingPlayers', async (players) => {
   
   // Track their names and mark as active
   activePlayers = [];
+  const newPlayerIds = [];
   players.forEach(p => {
     if (p.socketId && p.name) {
       playerNames[p.socketId] = p.name;
       activePlayers.push(p.socketId);
+      newPlayerIds.push(p.socketId);
     }
   });
   
-  // Wait for local stream to be ready before creating peer connections
-  if (localStream) {
-    // Create peer connections with all existing players
-    for (const player of players) {
-      await createPeerConnectionAndOffer(player.socketId);
+  // CLEANUP: Close peer connections to socket IDs that are NO LONGER in the players list
+  // This handles reconnection scenarios where a player leaves and comes back with a new socket ID
+  const currentPeerSocketIds = Object.keys(peerConnections);
+  for (const socketId of currentPeerSocketIds) {
+    if (!newPlayerIds.includes(socketId)) {
+      console.log(`🧹 Closing stale peer connection to ${socketId.substring(0,6)} (not in current players list)`);
+      if (peerConnections[socketId]) {
+        try {
+          peerConnections[socketId].close();
+        } catch (e) {
+          console.warn(`   Warning: Error closing PC: ${e.message}`);
+        }
+        delete peerConnections[socketId];
+      }
+      // Also remove from feed
+      removePlayerFeed(socketId);
     }
-  } else {
-    // If camera not ready yet, connections will be created when camera initializes
-    console.log('⏳ Camera not ready yet, peer connections will be created after initialization');
   }
+  
+  // Note: Wait for camera to initialize before creating peer connections
+  // Camera init will call setupPeerConnection for all existing players
+  console.log('⏳ Existing players tracked. Peer connections will form after camera initialization.');
 });
 
 // Handle when a new player joins the room
 socket.on('newPlayerJoined', async (playerInfo) => {
-  console.log('👤 New player joined:', playerInfo);
+  console.log('👤 New player joined room:', playerInfo);
   
   if (playerInfo && playerInfo.socketId && playerInfo.name) {
     // Track the new player's name
@@ -2178,13 +2137,8 @@ socket.on('newPlayerJoined', async (playerInfo) => {
     activePlayers.push(playerInfo.socketId); // Add to active players
     console.log('📝 Tracked new player name:', playerInfo.name, 'for socketId:', playerInfo.socketId);
     
-    // Create peer connection with the new player if we have a local stream
-    if (localStream) {
-      console.log('📞 Creating peer connection with new player:', playerInfo.socketId);
-      await createPeerConnectionAndOffer(playerInfo.socketId);
-    } else {
-      console.log('⏳ No local stream yet, will create connection when camera initializes');
-    }
+    // Note: setupPeerConnection will be called via sfuPlayerJoined when they emit joinGameSFU
+    // This just ensures we know their name first
   } else {
     console.error('❌ Invalid playerInfo received:', playerInfo);
   }
@@ -2207,322 +2161,280 @@ socket.on('playerDisconnected', ({ socketId }) => {
   delete playerNames[socketId];
 });
 
-// Helper to create peer connection and send offer
-async function createPeerConnectionAndOffer(remoteSocketId) {
-  if (peerConnections[remoteSocketId]) {
-    console.log('Peer connection already exists for', remoteSocketId);
-    return;
-  }
-  
-  try {
-    const pc = await createPeerConnection(remoteSocketId);
-    
-    // Only create offer if our socketId is smaller (to avoid both sides offering)
-    if (mySocketId < remoteSocketId) {
-      console.log('📞 Creating offer for', remoteSocketId);
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      console.log('📤 Sending offer to', remoteSocketId);
-      socket.emit('offer', { to: remoteSocketId, offer });
-      console.log('✅ Offer emitted to', remoteSocketId);
-    } else {
-      console.log('⏳ Waiting for offer from', remoteSocketId);
-    }
-  } catch (err) {
-    console.error('❌ Error creating peer connection:', err);
-  }
-}
+
+/* UPDATE: REMOVED createPeerConnectionAndOffer() - using setupPeerConnection() instead (see line ~707)
+   The old function was emitting to wrong event names and didn't implement SFU coordination properly.
+*/
 
 /* ===============================
    WEBRTC SIGNALING HANDLERS
 ================================ */
-socket.on('offer', async ({ from, offer }) => {
+/* ===============================
+   SFU SIGNALING HANDLERS (Simplified)
+================================ */
+
+/**
+ * SFU_PLAYER_JOINED
+ * Server notifies us that a new player joined the game
+ */
+socket.on('sfuPlayerJoined', async ({ socketId, playerName }) => {
+  console.log('👤 SFU: Player joined -', playerName, `(${socketId.substring(0,6)})`);
+  
+  if (socketId === mySocketId) return; // Ignore our own join
+  
+  // Track the player
+  playerNames[socketId] = playerName;
+  
+  // Setup peer connection if camera is ready
+  if (localStream && readyToConnect) {
+    console.log('📞 Setting up peer connection with new player');
+    await setupPeerConnection(socketId);
+  }
+});
+
+/**
+ * SFU_OFFER_RECEIVED
+ * Server relays offer from another player to us
+ * Uses lower-socketId rule: only the peer with lower ID should send the initial offer
+ */
+socket.on('sfuOfferReceived', async ({ from, offer }) => {
+  console.log('📨 SFU: Received offer from', from.substring(0,6));
+  
+  // Prevent concurrent signaling operations on the same peer connection
+  if (processingSignaling[from]) {
+    console.log('   ⏳ Already processing signaling for', from.substring(0,6), '- queuing this offer');
+    // In production, would queue this for later, but for now just skip to avoid corruption
+    return;
+  }
+  
+  processingSignaling[from] = true;
+  
   try {
-    // If camera not initialized yet, queue this offer to handle after initialization
     if (!localStream) {
-      console.log('⏳ Camera not ready, queuing offer from', from);
-      pendingOffers.push({ from, offer });
+      console.log('⏳ Camera not ready, queuing offer');
+      pendingPeerOffers[from] = offer;
+      processingSignaling[from] = false;
       return;
     }
     
-    console.log('📨 Received offer from', from);
-    console.log('  🔍 Existing PC:', !!peerConnections[from], 'localStream:', !!localStream);
-    
-    // Check for offer collision - if we have higher socketId, we should be polite and accept their offer
-    const existingPc = peerConnections[from];
-    const isPolite = mySocketId > from;
-    
-    // During initial connection (have-local-offer with no remote description), use politeness
-    // But once connection is established, always accept offers for renegotiation/recovery
-    const isInitialHandshake = existingPc && existingPc.signalingState === 'have-local-offer' && !existingPc.remoteDescription;
-    
-    console.log('  PC state:', existingPc?.signalingState, 'isPolite:', isPolite, 'isInitialHandshake:', isInitialHandshake);
-    
-    if (isInitialHandshake && !isPolite) {
-      console.log('⚠️ Initial offer collision with', from, '- ignoring (we are impolite)');
+    // COLLISION DETECTION: If offer is from someone with HIGHER socketId, 
+    // that's a protocol violation (they should wait for OUR offer)
+    if (from > mySocketId) {
+      console.log('⚠️ COLLISION: Received offer from', from.substring(0,6), 'who has HIGHER ID than us');
+      console.log('   (They should wait for our offer since', mySocketId, '<', from, ')');
+      processingSignaling[from] = false;
       return;
     }
     
+    // Create or get peer connection
     const pc = await createPeerConnection(from);
-    console.log('  ✅ PC ready, signaling state:', pc.signalingState);
     
-    // Check if we're missing video from this peer
-    const isMissingVideoFromPeer = !lastRenegotiationAttempt[from] || lastRenegotiationAttempt[from] !== 'complete';
-    
-    // If we already have a remote description AND signaling state is not stable, skip UNLESS we're missing video from this peer
-    if (pc.remoteDescription && pc.signalingState !== 'stable' && !isMissingVideoFromPeer) {
-      console.log('⏭️  Skipping offer from', from, '- signaling in progress and video confirmed');
+    // Skip if we already have a remote description (avoid duplicate offer processing)
+    if (pc.remoteDescription) {
+      console.log('⏭️ Already have remote description for', from.substring(0,6), '- skipping duplicate offer');
+      processingSignaling[from] = false;
       return;
     }
     
-    // Handle offer collision (glare) - if we're in have-local-offer state and we're polite, roll back
-    if (pc.signalingState === 'have-local-offer') {
-      if (isPolite) {
-        console.log('⚠️ Offer collision detected with', from, '- rolling back (we are polite)');
-        await pc.setLocalDescription({ type: 'rollback' });
-      } else {
-        console.log('⚠️ Offer collision detected with', from, '- ignoring (we are impolite)');
-        return;
-      }
+    // Set their offer as remote (use modern API - no RTCSessionDescription wrapper)
+    console.log('   DEBUG: offer object =', offer);
+    console.log('   DEBUG: offer.type =', offer.type, ', offer.sdp length =', offer.sdp?.length);
+    
+    if (!offer || !offer.type || !offer.sdp) {
+      console.error('   ❌ Invalid offer object! type:', offer?.type, 'sdp exists:', !!offer?.sdp);
+      processingSignaling[from] = false;
+      throw new Error('Invalid offer object');
     }
     
-    console.log('  🔗 About to set remote description for', from);
+    console.log('   🔄 Calling setRemoteDescription...');
     await pc.setRemoteDescription(offer);
+    console.log('  ✅ setRemoteDescription completed');
     console.log('  🔗 Remote description set');
     
-    // ⚠️ CRITICAL: Transceiver state management for three-player video
-    // When setRemoteDescription() is called, browser creates recvonly transceivers for incoming media.
-    // We MUST: 1) Change them to sendrecv, 2) Bind our local tracks to the right transceivers
-    // Otherwise createAnswer() generates disabled media (port 9, 0.0.0.0).
-    // See git commit 3e292d7 and /memories/repo/WebRTC_3Player_Video_Solution.md
-    // 🚨 DO NOT REMOVE OR MODIFY THIS SECTION 🚨
-    
-    let transceivers = pc.getTransceivers();
-    console.log('  🎬 Checking transceivers after setRemoteDescription - total:', transceivers.length);
-    
-    try {
-      for (let i = 0; i < transceivers.length; i++) {
-        const t = transceivers[i];
-        
-        // Change recvonly transceivers to sendrecv
-        if (t.direction === 'recvonly') {
-          t.direction = 'sendrecv';
-          console.log(`  🔄 Changed transceiver[${i}] from recvonly to sendrecv`);
-        }
-        
-        // CRITICAL: Bind our local tracks to transceivers that will be used in the answer
-        // This ensures createAnswer() includes our media with valid ports
-        if (localStream) {
-          const existingTrack = t.sender.track;
-          if (!existingTrack && i < 2) {
-            // This transceiver doesn't have a track assigned - assign one
-            try {
-              const trackKind = t.mid === 0 || i === 0 ? 'audio' : 'video';
-              const localTracks = trackKind === 'audio' 
-                ? localStream.getAudioTracks() 
-                : localStream.getVideoTracks();
-              
-              if (localTracks.length > 0) {
-                await t.sender.replaceTrack(localTracks[0]);
-                console.log(`  ✔️ Assigned ${trackKind} track (${localTracks[0].id}) to transceiver[${i}]`);
-              }
-            } catch (err) {
-              console.warn(`  ⚠️ Error assigning track to transceiver[${i}]:`, err.message);
-            }
-          } else if (existingTrack) {
-            console.log(`  ℹ️ Transceiver[${i}] already has ${existingTrack.kind} track`);
+    // Process any queued ICE candidates NOW that remote description exists
+    if (pendingIceCandidates[from]) {
+      console.log('   📤 Processing', pendingIceCandidates[from].length, 'queued ICE candidates');
+      const queuedCount = pendingIceCandidates[from].length;
+      for (let i = 0; i < queuedCount; i++) {
+        const queuedCandidate = pendingIceCandidates[from][i];
+        try {
+          await pc.addIceCandidate(queuedCandidate);
+          console.log('   ✅ Added queued ICE candidate', i+1, 'of', queuedCount);
+        } catch (candidateErr) {
+          if (candidateErr.name !== 'OperationError') {
+            console.error('   ❌ Error adding queued candidate:', candidateErr.name);
           }
         }
       }
-      console.log('✅ Transceivers configured for answer');
-    } catch (err) {
-      console.warn('  ⚠️ Error managing transceivers:', err.message);
-    }
-    
-    // Process any queued ICE candidates
-    if (pc.pendingIceCandidates && pc.pendingIceCandidates.length > 0) {
-      console.log('📥 Processing', pc.pendingIceCandidates.length, 'queued ICE candidates for', from);
-      for (const candidate of pc.pendingIceCandidates) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (err) {
-          console.error('❌ Error adding queued ICE candidate:', err);
-        }
-      }
-      pc.pendingIceCandidates = [];
-    }
-    
-    // Debug: Check transceiver state before creating answer
-    console.log('🔍 Transceiver state before answer for', from, ':');
-    transceivers.forEach((t, i) => {
-      console.log(`  [${i}] direction: ${t.direction}, sender.track: ${t.sender.track ? '✅ ' + t.sender.track.kind : '❌ null'}`);
-    });
-    
-    console.log('📝 Creating answer for', from);
-    const answer = await pc.createAnswer();
-    console.log('  📦 Answer created, answer object keys:', Object.keys(answer));
-    
-    // Log SDP to verify tracks are included
-    const answerSDP = answer.sdp;
-    const hasAudioM = answerSDP.includes('m=audio');
-    const hasVideoM = answerSDP.includes('m=video');
-    const audioRecvLines = (answerSDP.match(/a=recvonly|a=sendrecv/g) || []).length;
-    const audioPortMatch = answerSDP.match(/^m=audio ([0-9]+)/m);
-    const audioPort = audioPortMatch ? audioPortMatch[1] : 'unknown';
-    const videoPortMatch = answerSDP.match(/^m=video ([0-9]+)/m);
-    const videoPort = videoPortMatch ? videoPortMatch[1] : 'unknown';
-    
-    console.log(`  📋 Answer SDP: audio=${hasAudioM}(port:${audioPort}) video=${hasVideoM}(port:${videoPort}) recv-capable lines=${audioRecvLines}`);
-    console.log('  📋 SDP media lines:', (answerSDP.match(/^m=/gm) || []).length, 'lines');
-    console.log('  📋 First 200 chars of SDP:', answerSDP.substring(0, 200));
-    console.log('  Answer object type:', answer.type, 'SDP length:', answer.sdp?.length);
-    
-    // SAFETY CHECK: If audio port is disabled (port 9), log warning
-    if (audioPort === '9') {
-      console.warn('🚨 WARNING: Answer SDP has DISABLED audio port (9)! This will break video for', from);
-      console.warn('   Transceivers before answer:', transceivers.map((t, i) => `[${i}]=${t.direction}(sender:${t.sender.track?.kind || 'none'})`).join(' '));
-    }
-    
-    await pc.setLocalDescription(answer);
-    console.log('  ✅ Local description set');
-    
-    console.log('📤 Sending answer to', from, 'answer object structure: type=' + answer.type + ' sdp.length=' + answer.sdp.length);
-    socket.emit('answer', { to: from, answer });
-    console.log('  ✅ Answer emitted via socket');
-  } catch (err) {
-    console.error('❌ Error handling offer from', from, ':', err);
-  }
-});
-
-socket.on('answer', async ({ from, answer }) => {
-  console.log('📨 Received answer from', from, 'answer object:', answer);
-  try {
-    const pc = peerConnections[from];
-    console.log('  PC exists?', !!pc, 'Answer type?', answer?.type, 'Answer SDP length?', answer?.sdp?.length);
-    
-    if (!pc) {
-      console.warn('❌ ANSWER FAILED: No peer connection found for', from);
-      return;
-    }
-    
-    if (!answer) {
-      console.warn('❌ ANSWER FAILED: No answer data from', from);
-      return;
-    }
-    
-    if (!answer.type || !answer.sdp) {
-      console.warn('❌ ANSWER FAILED: Invalid answer structure from', from, 'type:', answer.type, 'has SDP?', !!answer.sdp);
-      return;
-    }
-    
-    console.log('  Current signaling state:', pc.signalingState);
-    
-    // Only accept answers when we're expecting one (have a pending offer)
-    // The state machine handles renegotiation: even after prior remote description,
-    // if we send a new offer, state becomes 'have-local-offer' again and we accept the new answer
-    if (pc.signalingState !== 'have-local-offer') {
-      console.log('⏭️ Skipping answer from', from, '- not expecting answer (signaling state:', pc.signalingState + ')');
-      return;
-    }
-    
-    console.log('  ✅ Proceeding to setRemoteDescription for', from);
-    try {
-      console.log('  About to call setRemoteDescription with answer type:', answer.type);
-      await pc.setRemoteDescription(answer);
-      console.log('✅ Remote description set for', from, 'new signaling state:', pc.signalingState);
-    } catch (err) {
-      console.error('❌ SETREMOTEDESCRIPTION FAILED for', from, 'error:', err.message, 'error name:', err.name, 'signaling state was:', pc.signalingState);
-      return;
-    }
-    
-    // Process any queued ICE candidates
-    if (pc.pendingIceCandidates && pc.pendingIceCandidates.length > 0) {
-      console.log('📥 Processing', pc.pendingIceCandidates.length, 'queued ICE candidates for', from);
-      for (const candidate of pc.pendingIceCandidates) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (err) {
-          console.error('❌ Error adding queued ICE candidate:', err);
-        }
-      }
-      pc.pendingIceCandidates = [];
-    }
-  } catch (err) {
-    console.error('❌ OUTER TRY/CATCH ERROR handling answer from', from, ':', err, 'error name:', err.name);
-  }
-});
-
-socket.on('requestOffer', async ({ from }) => {
-  try {
-    console.log('📨 Received offer request from', from);
-    const pc = peerConnections[from];
-    if (!pc) {
-      console.warn('⚠️ No peer connection with', from, 'to send offer');
-      return;
-    }
-    
-    console.log('  PC signaling state:', pc.signalingState, 'remoteDescription exists?', !!pc.remoteDescription);
-    
-    // Only respond to requestOffer if we're in a stable state
-    // Don't try to create offers while negotiation is happening
-    if (pc.signalingState !== 'stable') {
-      console.log('⏭️ Skipping requestOffer from', from, '- not in stable state');
-      return;
-    }
-    
-    // Only send offer if we have local stream
-    if (localStream) {
-      console.log('📝 Creating offer in response to request from', from);
-      try {
-        const offer = await pc.createOffer();
-        
-        // Double-check state before setting local description (state may have changed during createOffer)
-        if (pc.signalingState !== 'stable') {
-          console.log('⏭️ State changed during createOffer for', from, '- now:', pc.signalingState, '- aborting');
-          return;
-        }
-        
-        await pc.setLocalDescription(offer);
-        socket.emit('offer', { to: from, offer: pc.localDescription });
-        console.log('📤 Sent requested offer to', from);
-      } catch (err) {
-        console.error('❌ Error creating/sending requested offer to', from, ':', err.message);
-      }
+      delete pendingIceCandidates[from];
+      console.log('   ✅ All queued candidates processed, queue cleared');
     } else {
-      console.warn('⚠️ Cannot send offer to', from, '- no local stream');
+      console.log('   ℹ️ No queued ICE candidates to process');
     }
+    
+    // Create and send answer
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    
+    socket.emit('sfuAnswer', { to: from, answer: pc.localDescription });
+    console.log('📤 Sent answer back to', from.substring(0,6));
   } catch (err) {
-    console.error('❌ Error handling offer request from', from, ':', err);
+    console.error('❌ Error handling SFU offer from', from.substring(0,6), ':', err.name, '-', err.message);
+  } finally {
+    processingSignaling[from] = false;
   }
 });
 
-socket.on('ice-candidate', async ({ from, candidate }) => {
+/**
+ * SFU_ANSWER_RECEIVED  
+ * Server relays answer from another player back to us
+ */
+socket.on('sfuAnswerReceived', async ({ from, answer }) => {
+  console.log('📨 SFU: Received answer from', from.substring(0,6));
+  console.log('   DEBUG: answer object =', answer);
+  console.log('   DEBUG: answer.type =', answer.type, ', answer.sdp length =', answer.sdp?.length);
+  
+  // Queue answer if camera not ready yet or peer connection not created
+  if (!localStream || !peerConnections[from]) {
+    console.log('⏳ Queuing answer from', from.substring(0,6), '- camera ready:', !!localStream, 'PC ready:', !!peerConnections[from]);
+    pendingPeerAnswers[from] = answer;
+    return;
+  }
+  
+  // Prevent concurrent signaling operations on the same peer connection
+  if (processingSignaling[from]) {
+    console.log('   ⏳ Already processing signaling for', from.substring(0,6), '- skipping to avoid race');
+    return; // Skip to avoid concurrent modification
+  }
+  
+  processingSignaling[from] = true;
+  
   try {
     const pc = peerConnections[from];
-    if (pc && candidate) {
-      // Check if remote description is set before adding ICE candidate
-      if (pc.remoteDescription && pc.remoteDescription.type) {
-        await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        console.log('✅ Added ICE candidate from', from);
-      } else {
-        console.log('⏳ Queuing ICE candidate from', from, '(remote description not set yet)');
-        // Queue the candidate to be added after remote description is set
-        if (!pc.pendingIceCandidates) {
-          pc.pendingIceCandidates = [];
+    if (!pc) {
+      console.warn('❌ No peer connection with', from);
+      processingSignaling[from] = false;
+      return;
+    }
+    
+    if (pc.signalingState !== 'have-local-offer') {
+      console.log('⏭️ Not expecting answer (state:', pc.signalingState, '), skipping');
+      processingSignaling[from] = false;
+      return;
+    }
+    
+    console.log('   About to setRemoteDescription with answer...');
+    await pc.setRemoteDescription(answer);
+    console.log('✅ Remote description set from answer');
+    
+    // Process any queued ICE candidates now that remote description exists
+    if (pendingIceCandidates[from] && pendingIceCandidates[from].length > 0) {
+      console.log('   📤 Processing', pendingIceCandidates[from].length, 'queued ICE candidates');
+      for (const queuedCandidate of pendingIceCandidates[from]) {
+        try {
+          await pc.addIceCandidate(queuedCandidate);
+          console.log('   ✅ Added queued ICE candidate');
+        } catch (candidateErr) {
+          if (candidateErr.name !== 'OperationError') {
+            console.error('   ❌ Error adding queued candidate:', candidateErr.name);
+          }
         }
-        pc.pendingIceCandidates.push(candidate);
       }
-    } else if (!pc) {
-      // PC doesn't exist yet - queue this candidate to add when PC is created
-      console.log('⏳ Queuing ICE candidate from', from, '(peer connection not created yet)');
+      delete pendingIceCandidates[from];
+    }
+  } catch (err) {
+    console.error('❌ Error handling SFU answer from', from.substring(0,6), ':', err.name, '-', err.message);
+  } finally {
+    processingSignaling[from] = false;
+  }
+});
+
+/**
+ * SFU_ICE_CANDIDATE_RECEIVED
+ * Server relays ICE candidate from another player
+ */
+socket.on('sfuIceCandidateReceived', async ({ from, candidate }) => {
+  try {
+    const pc = peerConnections[from];
+    if (!pc) {
+      console.log('⏳ No PC yet, would queue candidate from', from.substring(0,6));
+      return;
+    }
+    
+    if (!pc.remoteDescription) {
+      console.log('⏳ No remote description yet for', from.substring(0,6), '- QUEUING ICE candidate');
+      // Initialize queue if needed
       if (!pendingIceCandidates[from]) {
         pendingIceCandidates[from] = [];
       }
+      // Store the candidate for later processing
       pendingIceCandidates[from].push(candidate);
+      console.log('   (Queue size now:', pendingIceCandidates[from].length, ')');
+      return;
     }
+    
+    await pc.addIceCandidate(candidate);
+    console.log('✅ Added ICE candidate from', from.substring(0,6));
   } catch (err) {
-    console.error('❌ Error adding ICE candidate from', from, ':', err);
+    if (err.name !== 'OperationError') { // OperationError is normal when PC is in wrong state
+      console.error('❌ Error adding ICE candidate from', from?.substring?.(0,6), ':', err.name, '-', err.message);
+    }
   }
+});
+
+/**
+ * SFU_OFFER_REQUESTED
+ * Another player requested a fresh offer from us
+ */
+socket.on('sfuOfferRequested', async ({ from }) => {
+  console.log('🔄 SFU: Player', from.substring(0,6), 'requested fresh offer');
+  
+  try {
+    const pc = peerConnections[from];
+    if (!pc) {
+      console.log('⏭️ No connection with', from.substring(0,6));
+      return;
+    }
+    
+    if (pc.signalingState !== 'stable') {
+      console.log('⏭️ Connection not stable (state:', pc.signalingState, ') - skipping fresh offer');
+      return;
+    }
+    
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    
+    socket.emit('sfuOffer', { roomId, offer: pc.localDescription });
+    console.log('📤 Sent fresh offer to', from.substring(0,6));
+  } catch (err) {
+    console.error('❌ Error sending fresh offer:', err.name, '-', err.message);
+  }
+});
+
+/**
+ * SFU_PLAYER_DISCONNECTED
+ * Server notifies us a player left
+ */
+socket.on('sfuPlayerDisconnected', ({ socketId }) => {
+  console.log('👋 SFU: Player disconnected -', socketId.substring(0,6));
+  
+  // Close their peer connection
+  if (peerConnections[socketId]) {
+    peerConnections[socketId].close();
+    delete peerConnections[socketId];
+  }
+  
+  // Remove their feed
+  removePlayerFeed(socketId);
+  
+  // Clean up tracking
+  delete playerNames[socketId];
+  delete pendingPeerOffers[socketId];
+  delete pendingPeerAnswers[socketId];
+  delete pendingIceCandidates[socketId];
+  delete processingSignaling[socketId];
+  
+  console.log('   ✅ Cleaned up all state for', socketId.substring(0,6));
 });
 
 socket.on('playerStats', ({ playerName, stats }) => {
@@ -2531,6 +2443,326 @@ socket.on('playerStats', ({ playerName, stats }) => {
   if (socketId) {
     updatePlayerFeedStats(socketId, stats);
   }
+});
+
+/* ===============================
+   TEXAS HOLD 'EM SOCKET EVENTS
+================================ */
+
+socket.on('promptBuyIn', ({ minBuyIn, maxBuyIn, suggestedBuyIn }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  
+  console.log('💰 Buy-in prompt received');
+  
+  // Show buy-in dialog
+  const buyInAmount = prompt(
+    `Buy in amount?\n(Minimum: $${minBuyIn.toFixed(2)}, Maximum: $${maxBuyIn.toFixed(2)}, Suggested: $${suggestedBuyIn.toFixed(2)})`,
+    suggestedBuyIn.toFixed(2)
+  );
+  
+  if (buyInAmount === null) {
+    // User cancelled, show alert and prompt again
+    alert('You must buy in to play');
+    socket.emit('promptBuyIn', { minBuyIn, maxBuyIn, suggestedBuyIn });
+    return;
+  }
+  
+  const amount = parseFloat(buyInAmount);
+  if (isNaN(amount) || amount < minBuyIn || amount > maxBuyIn) {
+    alert(`Invalid amount. Must be between $${minBuyIn.toFixed(2)} and $${maxBuyIn.toFixed(2)}`);
+    socket.emit('promptBuyIn', { minBuyIn, maxBuyIn, suggestedBuyIn });
+    return;
+  }
+  
+  socket.emit('submitBuyIn', { roomId, buyInAmount: amount });
+});
+
+socket.on('playersUpdated', (players) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  
+  console.log('👥 Players updated:', players);
+  const allReady = players.every(p => p.ready);
+  const readyCount = players.filter(p => p.ready).length;
+  
+  if (allReady && players.length >= 2) {
+    console.log(`✅ All ${players.length} players are ready!`);
+  } else {
+    console.log(`⏳ Waiting for players to ready up (${readyCount}/${players.length})`);
+  }
+  
+  // Update UI to show player status
+  // You can display this in a waiting area or status message
+  displayGameMessage(`Players: ${readyCount}/${players.length} ready`, 'info');
+});
+
+socket.on('gameStarted', ({ players, blinds, dealerButton }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  
+  console.log('🎮 Texas Hold Em game started');
+  console.log(`Small blind: $${blinds.small.toFixed(2)}, Big blind: $${blinds.big.toFixed(2)}`);
+  
+  // Display player seating
+  const seatingArea = document.getElementById('seatingArea');
+  seatingArea.innerHTML = '';
+  
+  players.forEach((player, index) => {
+    displayPlayerAtSeat(index, {
+      id: player.id,
+      name: player.name,
+      stack: player.stack,
+      isCurrentBettor: false
+    });
+  });
+  
+  displayGameMessage('Game started! Dealing cards...', 'info');
+});
+
+socket.on('dealCards', ({ holeCards }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  
+  console.log('🎰 You received hole cards');
+  playerCards = holeCards;
+  
+  displayPlayerHoleCards(mySocketId, holeCards);
+  displayGameMessage('Pre-flop betting round', 'info');
+});
+
+socket.on('gameState', ({ state, pot, communityCards, currentBettor, players }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  
+  console.log(`📊 Game state: ${state}, Pot: $${pot.toFixed(2)}`);
+  
+  // Update pot display
+  updatePotDisplay(pot);
+  
+  // Update community cards
+  if (communityCards && communityCards.length > 0) {
+    displayCommunityCards(communityCards);
+  }
+  
+  // Update players
+  players.forEach((player, index) => {
+    const seatDiv = document.getElementById(`seat-${index}`);
+    if (seatDiv) {
+      if (player.folded) {
+        seatDiv.classList.add('folded');
+      } else if (player.allIn) {
+        seatDiv.classList.add('all-in');
+      }
+      
+      if (player.currentBet > 0) {
+        updatePlayerBetDisplay(player.id, player.currentBet);
+      }
+    }
+  });
+  
+  // Show betting controls if it's our turn
+  if (currentBettor === mySocketId) {
+    showBettingControls({ 
+      highestBet: 0, 
+      playerCurrentBet: players.find(p => p.id === mySocketId)?.currentBet || 0,
+      pot: pot || 0,
+      playerStack: players.find(p => p.id === mySocketId)?.stack || 0,
+      smallBlind: 0.05,
+      bigBlind: 0.10
+    });
+  } else {
+    hideBettingControls();
+  }
+});
+
+socket.on('gameStateUpdated', ({ state, pot, communityCards, currentBettor, highestBet, players }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  
+  console.log(`📊 State updated: ${state}`);
+  
+  // Update display based on state
+  if (state === 'flop' && communityCards.length === 3) {
+    displayGameMessage('Flop revealed', 'info');
+  } else if (state === 'turn' && communityCards.length === 4) {
+    displayGameMessage('Turn revealed', 'info');
+  } else if (state === 'river' && communityCards.length === 5) {
+    displayGameMessage('River revealed', 'info');
+  }
+  
+  // Update pot and community cards
+  updatePotDisplay(pot);
+  if (communityCards) displayCommunityCards(communityCards);
+  
+  // Update player displays
+  players.forEach((player, index) => {
+    const seatDiv = document.getElementById(`seat-${index}`);
+    if (seatDiv) {
+      seatDiv.classList.remove('folded', 'all-in', 'current-bettor');
+      
+      if (player.folded) seatDiv.classList.add('folded');
+      if (player.allIn) seatDiv.classList.add('all-in');
+      if (player.id === currentBettor) seatDiv.classList.add('current-bettor');
+      
+      // Update stack display
+      const stackDiv = seatDiv.querySelector('.player-stack');
+      if (stackDiv) stackDiv.textContent = `$${player.stack.toFixed(2)}`;
+      
+      if (player.currentBet > 0) {
+        updatePlayerBetDisplay(player.id, player.currentBet);
+      }
+    }
+  });
+  
+  // Show/hide betting controls
+  if (currentBettor === mySocketId) {
+    const myPlayer = players.find(p => p.id === mySocketId);
+    showBettingControls({ 
+      highestBet: highestBet, 
+      playerCurrentBet: myPlayer?.currentBet || 0,
+      pot: pot || 0,
+      playerStack: myPlayer?.stack || 0,
+      smallBlind: smallBlind || 0.05,
+      bigBlind: bigBlind || 0.10
+    });
+  } else {
+    hideBettingControls();
+  }
+});
+
+socket.on('handComplete', ({ winners, winnerNames, pot, method, allHands, sidePotDistribution, winnings }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  
+  console.log('🏆 Hand complete!');
+  
+  let message = '';
+  if (method === 'fold') {
+    message = `${winnerNames.join(', ')} won $${pot.toFixed(2)} (everyone else folded)`;
+  } else {
+    // Showdown - show side pots if applicable
+    if (sidePotDistribution && sidePotDistribution.length > 1) {
+      message = '=== Side Pots ===\n';
+      sidePotDistribution.forEach((sidePot, idx) => {
+        message += `Pot ${idx + 1} ($${sidePot.potAmount.toFixed(2)}): ${sidePot.winners.join(', ')}\n`;
+      });
+      message += '\n=== Final Hands ===\n';
+      if (allHands) {
+        message += allHands.map(h => `${h.name}: ${h.hand}`).join('\n');
+      }
+    } else {
+      message = `${winnerNames.join(', ')} won $${pot.toFixed(2)}\n\n=== Final Hands ===\n`;
+      if (allHands) {
+        message += allHands.map(h => `${h.name}: ${h.hand}`).join('\n');
+      }
+    }
+  }
+  
+  displayGameMessage(message, 'info');
+  hideBettingControls();
+});
+
+socket.on('newHandStarted', ({ pot, players }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  
+  console.log('🔄 New hand started');
+  
+  // Clear community cards
+  const cardsList = document.getElementById('communityCardsList');
+  if (cardsList) cardsList.innerHTML = '';
+  
+  // Update player stacks
+  players.forEach((player, index) => {
+    const seatDiv = document.getElementById(`seat-${index}`);
+    if (seatDiv) {
+      seatDiv.classList.remove('folded', 'all-in');
+      const stackDiv = seatDiv.querySelector('.player-stack');
+      if (stackDiv) stackDiv.textContent = `$${player.stack.toFixed(2)}`;
+    }
+  });
+  
+  displayGameMessage('New hand starting...', 'info');
+});
+
+socket.on('blindsChanged', ({ smallBlind, bigBlind }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  
+  displayGameMessage(
+    `Blinds changed to $${smallBlind.toFixed(2)}/$${bigBlind.toFixed(2)}`,
+    'info'
+  );
+});
+
+socket.on('youBusted', ({ bustedAmount, minRebuy, maxRebuy, suggestedRebuy }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  
+  console.log('💔 You are busted! Stack: $' + bustedAmount.toFixed(2));
+  
+  displayGameMessage('You are busted! Choose to rebuy or watch.', 'warning');
+  
+  // Show rebuy/watch options
+  const choice = confirm(`You lost all your chips!\n\nClick OK to rebuy or Cancel to watch.`);
+  
+  if (choice) {
+    // Rebuy
+    const rebuyAmount = prompt(
+      `Rebuy amount?\n(Minimum: $${minRebuy.toFixed(2)}, Maximum: $${maxRebuy.toFixed(2)}, Suggested: $${suggestedRebuy.toFixed(2)})`,
+      suggestedRebuy.toFixed(2)
+    );
+    
+    if (rebuyAmount === null) {
+      // User cancelled - show watch option
+      socket.emit('chooseToWatch', { roomId });
+      displayGameMessage('You are now watching the game', 'info');
+      hideBettingControls();
+      return;
+    }
+    
+    const amount = parseFloat(rebuyAmount);
+    if (isNaN(amount) || amount < minRebuy || amount > maxRebuy) {
+      alert(`Invalid amount. Must be between $${minRebuy.toFixed(2)} and $${maxRebuy.toFixed(2)}`);
+      socket.emit('chooseToWatch', { roomId });
+      displayGameMessage('You are now watching the game', 'info');
+      hideBettingControls();
+      return;
+    }
+    
+    socket.emit('submitRebuy', { roomId, rebuyAmount: amount });
+    displayGameMessage(`Rebuying for $${amount.toFixed(2)}...`, 'info');
+  } else {
+    // Watch
+    socket.emit('chooseToWatch', { roomId });
+    displayGameMessage('You are now watching the game', 'info');
+    hideBettingControls();
+  }
+});
+
+socket.on('waitingForRebuys', ({ activePlayers, bustOut }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  
+  console.log('⏳ Waiting for rebuys...');
+  
+  let message = 'Not enough players to continue.\n\n';
+  message += 'Active: ' + activePlayers.map(p => p.name).join(', ') + '\n';
+  message += 'Busted: ' + bustOut.map(p => p.name).join(', ');
+  
+  displayGameMessage(message, 'info');
+  hideBettingControls();
+});
+
+socket.on('playerRebuyin', ({ playerId, playerName, rebuyAmount }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  
+  console.log(`${playerName} rebuys for $${rebuyAmount.toFixed(2)}`);
+  displayGameMessage(`${playerName} rebuys for $${rebuyAmount.toFixed(2)}`, 'info');
+});
+
+socket.on('playerWatching', ({ playerId, playerName }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  
+  console.log(`${playerName} is now watching`);
+  displayGameMessage(`${playerName} is now watching the game`, 'info');
+});
+
+socket.on('playerRejoinedGame', ({ playerId, playerName, buyInAmount }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  
+  console.log(`${playerName} rejoined for $${buyInAmount.toFixed(2)}`);
+  displayGameMessage(`${playerName} rejoined the game with $${buyInAmount.toFixed(2)}`, 'info');
 });
 
 // Handle player disconnection - clean up their feed and connection

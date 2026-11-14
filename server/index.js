@@ -4,6 +4,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const path = require('path');
 const { findBestHand, HAND_TYPE_RANK, rankValue, SUIT_RANK } = require('./utils');
+const texasHoldEmEngine = require('./texasHoldEmEngine');
 const firstPlayDone = {}; // roomId -> true/false
 const app = express();
 const server = http.createServer(app);
@@ -53,6 +54,12 @@ const hands = {};      // roomId -> { socketId: [card] }
 const started = {};    // roomId -> bool
 const inGame = {};     // roomId -> [socketId] - the 4 active players
 const waitingRoom = {}; // roomId -> [socketId] - players in waiting room
+
+// Texas Hold 'Em specific
+const roomGameTypes = {}; // roomId -> gameType ('chinesePoker' or 'texasHoldEm')
+const holdEmGames = {};    // roomId -> texasHoldEmGame object
+const holdEmPlayerData = {}; // roomId -> { socketId: { buyIn, stack, name, ready, status: 'active'|'watching'|'busted' } }
+const holdEmBustedPlayers = {}; // roomId -> Set of socketIds who busted and are watching
 
 // Turn/trick state
 const currentTurn = {};    // roomId -> socketId
@@ -414,71 +421,527 @@ function startGame(roomId) {
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  socket.on('joinRoom', ({ playerName, roomId }) => {
+  socket.on('joinRoom', ({ playerName, roomId, gameType = 'chinesePoker' }) => {
     socket.playerName = playerName;
     socket.roomId = roomId;
+    socket.gameType = gameType;
 
-    if (!rooms[roomId]) rooms[roomId] = [];
-    if (!ready[roomId]) ready[roomId] = {};
-    if (!inGame[roomId]) inGame[roomId] = [];
-    if (!waitingRoom[roomId]) waitingRoom[roomId] = [];
-    if (started[roomId] == null) started[roomId] = false;
+    // Initialize game type for room (all players in a room play the same game)
+    if (!roomGameTypes[roomId]) {
+      roomGameTypes[roomId] = gameType;
+      console.log(`🎮 Room ${roomId} set to ${gameType}`);
+    }
 
-    if (rooms[roomId].length >= 10) {
-      socket.emit('errorMessage', 'Room is full (max 10 players).');
+    // Initialize Chinese Poker state
+    if (gameType === 'chinesePoker') {
+      if (!rooms[roomId]) rooms[roomId] = [];
+      if (!ready[roomId]) ready[roomId] = {};
+      if (!inGame[roomId]) inGame[roomId] = [];
+      if (!waitingRoom[roomId]) waitingRoom[roomId] = [];
+      if (started[roomId] == null) started[roomId] = false;
+
+      if (rooms[roomId].length >= 10) {
+        socket.emit('errorMessage', 'Room is full (max 10 players).');
+        return;
+      }
+
+      socket.join(roomId);
+      rooms[roomId].push({ socket, name: playerName });
+      ready[roomId][socket.id] = false;
+
+      // Automatically assign to active game or waiting room based on position
+      if (started[roomId] === true) {
+        waitingRoom[roomId].push(socket.id);
+        const queuePosition = waitingRoom[roomId].length;
+        console.log(`Player ${playerName} (${socket.id}) joined mid-game, added to waiting room queue. Position: ${queuePosition}`);
+        const stats = playerStats[playerName] || { wins: 0, gamesPlayed: 0 };
+        socket.emit('playerStatus', { status: 'waiting', queuePosition, stats });
+      } else if (inGame[roomId].length < 4) {
+        inGame[roomId].push(socket.id);
+        console.log(`Player ${playerName} (${socket.id}) auto-joined active game. Count: ${inGame[roomId].length}`);
+        const stats = playerStats[playerName] || { wins: 0, gamesPlayed: 0 };
+        socket.emit('playerStatus', { status: 'active', queuePosition: -1, stats });
+      } else {
+        waitingRoom[roomId].push(socket.id);
+        const queuePosition = waitingRoom[roomId].length;
+        console.log(`Player ${playerName} (${socket.id}) auto-joined waiting room queue. Position: ${queuePosition}`);
+        const stats = playerStats[playerName] || { wins: 0, gamesPlayed: 0 };
+        socket.emit('playerStatus', { status: 'waiting', queuePosition, stats });
+      }
+
+      // Broadcast updated player list
+      io.to(roomId).emit('updatePlayers', rooms[roomId].map(p => ({
+        name: p.name,
+        ready: !!ready[roomId][p.socket.id]
+      })));
+      
+      const waiting = waitingRoom[roomId].map(sid => {
+        const p = rooms[roomId].find(pl => pl.socket.id === sid);
+        return p ? { socketId: p.socket.id, name: p.name } : null;
+      }).filter(x => x);
+      io.to(roomId).emit('waitingList', waiting);
+      
+      const otherPlayers = rooms[roomId]
+        .filter(p => p.socket.id !== socket.id)
+        .map(p => ({ socketId: p.socket.id, name: p.name }));
+      socket.emit('existingPlayers', otherPlayers);
+      
+      const newPlayerInfo = { socketId: socket.id, name: playerName };
+      socket.to(roomId).emit('newPlayerJoined', newPlayerInfo);
+    } 
+    // Initialize Texas Hold 'Em state
+    else if (gameType === 'texasHoldEm') {
+      if (!holdEmGames[roomId]) {
+        holdEmGames[roomId] = texasHoldEmEngine.createGame(roomId, 0.05, 0.10);
+      }
+      if (!holdEmPlayerData[roomId]) {
+        holdEmPlayerData[roomId] = {};
+      }
+
+      socket.join(roomId);
+      
+      // Store player data (will get buyIn amount from player)
+      holdEmPlayerData[roomId][socket.id] = {
+        name: playerName,
+        socket,
+        buyIn: 0,
+        stack: 0,
+        ready: false
+      };
+
+      console.log(`🤠 Player ${playerName} (${socket.id}) joined Texas Hold 'Em room ${roomId}`);
+      
+      // Prompt for buy-in amount
+      socket.emit('promptBuyIn', {
+        minBuyIn: 1.00,
+        maxBuyIn: 1000.00,
+        suggestedBuyIn: 10.00
+      });
+      
+      // Notify other players
+      const otherPlayers = Object.values(holdEmPlayerData[roomId])
+        .filter(p => p.socket.id !== socket.id)
+        .map(p => ({ socketId: p.socket.id, name: p.name }));
+      
+      socket.emit('existingPlayers', otherPlayers);
+      
+      io.to(roomId).emit('playerJoinedGame', {
+        socketId: socket.id,
+        name: playerName
+      });
+    }
+  });
+
+  /* ===============================
+     TEXAS HOLD 'EM HANDLERS
+  ================================ */
+
+  /**
+   * Handle Texas Hold 'Em buy-in submission
+   */
+  socket.on('submitBuyIn', ({ roomId, buyInAmount }) => {
+    if (!holdEmPlayerData[roomId] || !holdEmPlayerData[roomId][socket.id]) {
+      socket.emit('errorMessage', 'Invalid room or player data');
       return;
     }
 
-    socket.join(roomId);
-    rooms[roomId].push({ socket, name: playerName });
-    ready[roomId][socket.id] = false;
-
-    // Automatically assign to active game or waiting room based on position
-    // If game is already in progress, late joiners must wait until next game
-    if (started[roomId] === true) {
-      // Game in progress: all new players go to waiting room
-      waitingRoom[roomId].push(socket.id);
-      const queuePosition = waitingRoom[roomId].length;
-      console.log(`Player ${playerName} (${socket.id}) joined mid-game, added to waiting room queue. Position: ${queuePosition}`);
-      const stats = playerStats[playerName] || { wins: 0, gamesPlayed: 0 };
-      socket.emit('playerStatus', { status: 'waiting', queuePosition, stats });
-    } else if (inGame[roomId].length < 4) {
-      // Game not started and less than 4 players: join active game
-      inGame[roomId].push(socket.id);
-      console.log(`Player ${playerName} (${socket.id}) auto-joined active game. Count: ${inGame[roomId].length}`);
-      const stats = playerStats[playerName] || { wins: 0, gamesPlayed: 0 };
-      socket.emit('playerStatus', { status: 'active', queuePosition: -1, stats });
-    } else {
-      // Game not started but 4+ players: join waiting room queue
-      waitingRoom[roomId].push(socket.id);
-      const queuePosition = waitingRoom[roomId].length;
-      console.log(`Player ${playerName} (${socket.id}) auto-joined waiting room queue. Position: ${queuePosition}`);
-      const stats = playerStats[playerName] || { wins: 0, gamesPlayed: 0 };
-      socket.emit('playerStatus', { status: 'waiting', queuePosition, stats });
+    buyInAmount = parseFloat(buyInAmount) || 0;
+    if (buyInAmount < 1 || buyInAmount > 1000) {
+      socket.emit('errorMessage', 'Buy-in must be between $1 and $1000');
+      return;
     }
 
-    // Broadcast updated player list (all players)
-    io.to(roomId).emit('updatePlayers', rooms[roomId].map(p => ({
-      name: p.name,
-      ready: !!ready[roomId][p.socket.id]
-    })));
+    const playerData = holdEmPlayerData[roomId][socket.id];
+    playerData.buyIn = buyInAmount;
+    playerData.stack = buyInAmount;
+    playerData.ready = false; // Player must click ready to start game
+
+    console.log(`🤠 ${playerData.name} bought in for $${buyInAmount.toFixed(2)}. Waiting for ready...`);
+
+    // Broadcast updated player list
+    const allPlayers = Object.values(holdEmPlayerData[roomId])
+      .filter(p => p.stack > 0)
+      .map(p => ({ id: p.socket.id, name: p.name, ready: p.ready, stack: p.stack }));
+
+    io.to(roomId).emit('playersUpdated', allPlayers);
+  });
+
+  /**
+   * Handle Texas Hold 'Em ready click
+   */
+  socket.on('texasHoldEmReady', ({ roomId }) => {
+    if (!holdEmPlayerData[roomId] || !holdEmPlayerData[roomId][socket.id]) {
+      socket.emit('errorMessage', 'Invalid room or player data');
+      return;
+    }
+
+    const playerData = holdEmPlayerData[roomId][socket.id];
+    if (!playerData.stack || playerData.stack <= 0) {
+      socket.emit('errorMessage', 'Cannot ready up - no stack');
+      return;
+    }
+
+    playerData.ready = true;
+    console.log(`✋ ${playerData.name} is ready!`);
+
+    // Broadcast updated player list
+    const allPlayers = Object.values(holdEmPlayerData[roomId])
+      .filter(p => p.stack > 0)
+      .map(p => ({ id: p.socket.id, name: p.name, ready: p.ready, stack: p.stack }));
+
+    io.to(roomId).emit('playersUpdated', allPlayers);
+
+    // Check if all players are ready (at least 2 players with stack)
+    const playersWithStack = Object.values(holdEmPlayerData[roomId]).filter(p => p.stack > 0);
+    const readyPlayers = playersWithStack.filter(p => p.ready);
+
+    if (playersWithStack.length >= 2 && readyPlayers.length === playersWithStack.length) {
+      console.log(`🤠 All ${readyPlayers.length} players ready! Starting Texas Hold 'Em game`);
+      
+      // Initialize players in game engine
+      const game = holdEmGames[roomId];
+      game.players = readyPlayers.map((p, idx) => ({
+        id: p.socket.id,
+        name: p.name,
+        stack: p.stack,
+        currentBet: 0
+      }));
+
+      // Start first hand
+      texasHoldEmEngine.startNewHand(game);
+      
+      // Notify all players - game started
+      io.to(roomId).emit('gameStarted', {
+        players: game.players.map(p => ({ id: p.id, name: p.name, stack: p.stack })),
+        blinds: { small: game.smallBlind, big: game.bigBlind },
+        dealerButton: game.dealerButton
+      });
+
+      // Send hole cards to each player
+      game.players.forEach(player => {
+        const playerSocket = holdEmPlayerData[roomId][player.id]?.socket;
+        if (playerSocket) {
+          playerSocket.emit('dealCards', {
+            holeCards: game.playerHands[player.id]
+          });
+        }
+      });
+
+      // Broadcast community cards (none yet, but send state)
+      io.to(roomId).emit('gameState', {
+        state: game.state,
+        pot: game.pot,
+        communityCards: game.communityCards,
+        currentBettor: game.currentBettor,
+        players: game.players.map(p => ({ id: p.id, name: p.name, stack: p.stack, currentBet: p.currentBet }))
+      });
+    }
+  });
+
+  /**
+   * Handle Texas Hold 'Em player actions (bet, call, fold, etc.)
+   */
+  socket.on('pokerAction', ({ roomId, gameType, action, amount }) => {
+    if (gameType !== 'texasHoldEm' || !holdEmGames[roomId]) {
+      socket.emit('errorMessage', 'Invalid game');
+      return;
+    }
+
+    const game = holdEmGames[roomId];
     
-    // Emit waiting list (only waiting room players)
-    const waiting = waitingRoom[roomId].map(sid => {
-      const p = rooms[roomId].find(pl => pl.socket.id === sid);
-      return p ? { socketId: p.socket.id, name: p.name } : null;
-    }).filter(x => x);
-    io.to(roomId).emit('waitingList', waiting);
+    if (game.currentBettor !== socket.id) {
+      socket.emit('errorMessage', 'Not your turn');
+      return;
+    }
+
+    const player = game.players.find(p => p.id === socket.id);
+    if (!player) {
+      socket.emit('errorMessage', 'Player not found');
+      return;
+    }
+
+    // Handle the action
+    const result = texasHoldEmEngine.handlePlayerAction(game, socket.id, action, amount);
     
-    // Send list of all other players to new player for WebRTC setup
-    const otherPlayers = rooms[roomId]
-      .filter(p => p.socket.id !== socket.id)
-      .map(p => ({ socketId: p.socket.id, name: p.name }));
-    socket.emit('existingPlayers', otherPlayers);
-    
-    // Broadcast the new player to all existing players (so they can track the name)
-    const newPlayerInfo = { socketId: socket.id, name: playerName };
-    socket.to(roomId).emit('newPlayerJoined', newPlayerInfo);
+    if (result.error) {
+      socket.emit('errorMessage', result.error);
+      return;
+    }
+
+    // Check if hand is over (showdown or everyone folded)
+    if (game.state === 'showdown') {
+      const winnerResult = texasHoldEmEngine.determineWinner(game);
+      
+      io.to(roomId).emit('handComplete', {
+        winners: winnerResult.winners,
+        winnerNames: winnerResult.winnerNames,
+        pot: winnerResult.pot,
+        method: winnerResult.method,
+        allHands: winnerResult.allHands,
+        sidePotDistribution: winnerResult.sidePotDistribution,
+        winnings: winnerResult.winnings
+      });
+
+      // Check for busted players
+      for (const player of game.players) {
+        if (player.stack <= 0 && holdEmPlayerData[roomId][player.id]) {
+          holdEmPlayerData[roomId][player.id].status = 'busted';
+          holdEmPlayerData[roomId][player.id].stack = 0;
+          holdEmBustedPlayers[roomId] = holdEmBustedPlayers[roomId] || new Set();
+          holdEmBustedPlayers[roomId].add(player.id);
+          
+          // Notify busted player
+          const playerSocket = holdEmPlayerData[roomId][player.id].socket;
+          if (playerSocket) {
+            playerSocket.emit('youBusted', {
+              bustedAmount: player.stack,
+              minRebuy: 1.00,
+              maxRebuy: 1000.00,
+              suggestedRebuy: 10.00
+            });
+          }
+        }
+      }
+
+      // Reset for next hand (continuous game)
+      setTimeout(() => {
+        // Only keep players with stacks > 0 for next hand
+        const activePlayers = game.players.filter(p => p.stack > 0);
+        
+        if (activePlayers.length < 2) {
+          // Not enough players to continue - wait for rebuys
+          console.log(`🤠 Waiting for rebuys in room ${roomId}. Active: ${activePlayers.length}`);
+          io.to(roomId).emit('waitingForRebuys', {
+            activePlayers: activePlayers.map(p => ({ id: p.id, name: p.name, stack: p.stack })),
+            bustOut: Array.from(holdEmBustedPlayers[roomId] || []).map(id => ({
+              id,
+              name: holdEmPlayerData[roomId][id]?.name
+            }))
+          });
+        } else {
+          // Start next hand with remaining players
+          game.players = activePlayers;
+          texasHoldEmEngine.startNewHand(game);
+          
+          io.to(roomId).emit('newHandStarted', {
+            pot: game.pot,
+            players: game.players.map(p => ({ id: p.id, name: p.name, stack: p.stack }))
+          });
+        }
+      }, 3000);
+    } else {
+      // Broadcast game state update
+      const myPlayerStack = game.players.find(p => p.id === socket.id)?.stack || 0;
+      io.to(roomId).emit('gameStateUpdated', {
+        state: game.state,
+        pot: game.pot,
+        communityCards: game.communityCards,
+        currentBettor: game.currentBettor,
+        highestBet: game.highestBet,
+        smallBlind: game.smallBlind,
+        bigBlind: game.bigBlind,
+        playerStack: myPlayerStack,
+        players: game.players.map(p => ({ 
+          id: p.id, 
+          name: p.name, 
+          stack: p.stack, 
+          currentBet: p.currentBet,
+          folded: game.foldedPlayers.has(p.id),
+          allIn: game.allInPlayers.has(p.id)
+        }))
+      });
+    }
+  });
+
+  /**
+   * Handle blind change request (Texas Hold 'Em)
+   */
+  socket.on('requestBlindChange', ({ roomId, smallBlind, bigBlind }) => {
+    if (!holdEmGames[roomId]) {
+      socket.emit('errorMessage', 'Game not found');
+      return;
+    }
+
+    const game = holdEmGames[roomId];
+    const result = texasHoldEmEngine.requestBlindChange(game, socket.id, smallBlind, bigBlind);
+
+    if (result.error) {
+      socket.emit('errorMessage', result.error);
+      return;
+    }
+
+    // Notify all players of blind change request
+    io.to(roomId).emit('blindChangeProposed', {
+      proposedBy: socket.playerName,
+      smallBlind,
+      bigBlind,
+      votesNeeded: Math.ceil(game.players.length * 2 / 3)
+    });
+  });
+
+  /**
+   * Vote on blind change (Texas Hold 'Em)
+   */
+  socket.on('voteBlindChange', ({ roomId, approve }) => {
+    if (!holdEmGames[roomId]) {
+      socket.emit('errorMessage', 'Game not found');
+      return;
+    }
+
+    const game = holdEmGames[roomId];
+    const result = texasHoldEmEngine.voteOnBlindChange(game, socket.id, approve);
+
+    if (result.error) {
+      socket.emit('errorMessage', result.error);
+      return;
+    }
+
+    if (result.approved) {
+      io.to(roomId).emit('blindsChanged', {
+        smallBlind: result.newBlinds.smallBlind,
+        bigBlind: result.newBlinds.bigBlind,
+        effectiveNextHand: true
+      });
+    } else if (result.pending) {
+      io.to(roomId).emit('voteUpdate', {
+        votesReceived: result.votesNeeded,
+        votesNeeded: result.votesNeeded
+      });
+    }
+  });
+
+  /**
+   * Handle rebuy after busting out (Texas Hold 'Em)
+   */
+  socket.on('submitRebuy', ({ roomId, rebuyAmount }) => {
+    if (!holdEmPlayerData[roomId] || !holdEmPlayerData[roomId][socket.id]) {
+      socket.emit('errorMessage', 'Invalid room or player data');
+      return;
+    }
+
+    const playerData = holdEmPlayerData[roomId][socket.id];
+    if (playerData.status !== 'busted') {
+      socket.emit('errorMessage', 'Can only rebuy if busted');
+      return;
+    }
+
+    rebuyAmount = parseFloat(rebuyAmount) || 0;
+    if (rebuyAmount < 1 || rebuyAmount > 1000) {
+      socket.emit('errorMessage', 'Rebuy must be between $1 and $1000');
+      return;
+    }
+
+    // Update player data
+    playerData.stack = rebuyAmount;
+    playerData.status = 'active';
+    playerData.ready = true;
+
+    console.log(`🤠 ${playerData.name} rebuys for $${rebuyAmount.toFixed(2)}`);
+
+    // Remove from busted set
+    if (holdEmBustedPlayers[roomId]) {
+      holdEmBustedPlayers[roomId].delete(socket.id);
+    }
+
+    // Add back to game on next hand
+    const game = holdEmGames[roomId];
+    if (game) {
+      // If not already in game, add them
+      if (!game.players.find(p => p.id === socket.id)) {
+        game.players.push({
+          id: socket.id,
+          name: playerData.name,
+          stack: rebuyAmount,
+          currentBet: 0,
+          ready: true
+        });
+      } else {
+        // Already in game, just update stack
+        const p = game.players.find(p => p.id === socket.id);
+        if (p) p.stack = rebuyAmount;
+      }
+    }
+
+    // Notify all players
+    io.to(roomId).emit('playerRebuyin', {
+      playerId: socket.id,
+      playerName: playerData.name,
+      rebuyAmount
+    });
+  });
+
+  /**
+   * Handle player choosing to watch instead of rebuy (Texas Hold 'Em)
+   */
+  socket.on('chooseToWatch', ({ roomId }) => {
+    if (!holdEmPlayerData[roomId] || !holdEmPlayerData[roomId][socket.id]) {
+      socket.emit('errorMessage', 'Invalid room or player data');
+      return;
+    }
+
+    const playerData = holdEmPlayerData[roomId][socket.id];
+    playerData.status = 'watching';
+
+    console.log(`🤠 ${playerData.name} is watching`);
+
+    // Notify all players
+    io.to(roomId).emit('playerWatching', {
+      playerId: socket.id,
+      playerName: playerData.name
+    });
+  });
+
+  /**
+   * Handle player who was watching choosing to rejoin (Texas Hold 'Em)
+   */
+  socket.on('rejoinGame', ({ roomId, buyInAmount }) => {
+    if (!holdEmPlayerData[roomId] || !holdEmPlayerData[roomId][socket.id]) {
+      socket.emit('errorMessage', 'Invalid room or player data');
+      return;
+    }
+
+    const playerData = holdEmPlayerData[roomId][socket.id];
+    if (playerData.status !== 'watching') {
+      socket.emit('errorMessage', 'Can only rejoin if watching');
+      return;
+    }
+
+    buyInAmount = parseFloat(buyInAmount) || 0;
+    if (buyInAmount < 1 || buyInAmount > 1000) {
+      socket.emit('errorMessage', 'Buy-in must be between $1 and $1000');
+      return;
+    }
+
+    // Update player data
+    playerData.stack = buyInAmount;
+    playerData.status = 'active';
+    playerData.ready = true;
+
+    console.log(`🤠 ${playerData.name} rejoin game with $${buyInAmount.toFixed(2)}`);
+
+    // Add to game
+    const game = holdEmGames[roomId];
+    if (game) {
+      if (!game.players.find(p => p.id === socket.id)) {
+        game.players.push({
+          id: socket.id,
+          name: playerData.name,
+          stack: buyInAmount,
+          currentBet: 0,
+          ready: true
+        });
+      } else {
+        const p = game.players.find(p => p.id === socket.id);
+        if (p) p.stack = buyInAmount;
+      }
+    }
+
+    // Notify all players
+    io.to(roomId).emit('playerRejoinedGame', {
+      playerId: socket.id,
+      playerName: playerData.name,
+      buyInAmount
+    });
   });
 
   socket.on('revealHand', () => {
@@ -926,33 +1389,37 @@ if (!firstPlayDone[roomId]) {
 
   socket.on('disconnect', () => {
     const roomId = socket.roomId;
-    if (!roomId || !rooms[roomId]) return;
+    const gameType = socket.gameType;
 
-    // If player was in active game and it was their turn, advance turn
-    const wasActiveTurn = started[roomId] && currentTurn[roomId] === socket.id;
-    
-    rooms[roomId] = rooms[roomId].filter(p => p.socket.id !== socket.id);
-    if (inGame[roomId]) inGame[roomId] = inGame[roomId].filter(id => id !== socket.id);
-    if (waitingRoom[roomId]) waitingRoom[roomId] = waitingRoom[roomId].filter(id => id !== socket.id);
-    if (ready[roomId]) delete ready[roomId][socket.id];
-    if (hands[roomId]) delete hands[roomId][socket.id];
-    
-    // Broadcast disconnection to remaining players so they can clean up feeds
-    io.to(roomId).emit('playerDisconnected', { socketId: socket.id });
-    
-    // Auto-advance turn if it was disconnected player's turn
-    if (wasActiveTurn && inGame[roomId] && inGame[roomId].length > 0) {
-      currentTurn[roomId] = inGame[roomId][0]; // Move to first remaining player
-      emitTurn(roomId);
-    }
+    if (!roomId) return;
 
-    if (rooms[roomId].length === 0) {
-      delete rooms[roomId];
-      delete ready[roomId];
-      delete hands[roomId];
-      delete started[roomId];
-      delete inGame[roomId];
-      delete waitingRoom[roomId];
+    // Handle Chinese Poker disconnection
+    if (gameType === 'chinesePoker' && rooms[roomId]) {
+      // If player was in active game and it was their turn, advance turn
+      const wasActiveTurn = started[roomId] && currentTurn[roomId] === socket.id;
+      
+      rooms[roomId] = rooms[roomId].filter(p => p.socket.id !== socket.id);
+      if (inGame[roomId]) inGame[roomId] = inGame[roomId].filter(id => id !== socket.id);
+      if (waitingRoom[roomId]) waitingRoom[roomId] = waitingRoom[roomId].filter(id => id !== socket.id);
+      if (ready[roomId]) delete ready[roomId][socket.id];
+      if (hands[roomId]) delete hands[roomId][socket.id];
+      
+      // Broadcast disconnection to remaining players so they can clean up feeds
+      io.to(roomId).emit('playerDisconnected', { socketId: socket.id });
+      
+      // Auto-advance turn if it was disconnected player's turn
+      if (wasActiveTurn && inGame[roomId] && inGame[roomId].length > 0) {
+        currentTurn[roomId] = inGame[roomId][0]; // Move to first remaining player
+        emitTurn(roomId);
+      }
+
+      if (rooms[roomId].length === 0) {
+        delete rooms[roomId];
+        delete ready[roomId];
+        delete hands[roomId];
+        delete started[roomId];
+        delete inGame[roomId];
+        delete waitingRoom[roomId];
       delete currentTurn[roomId];
       delete lastPlay[roomId];
       delete passSet[roomId];
@@ -971,6 +1438,40 @@ if (!firstPlayDone[roomId]) {
       return p ? { socketId: p.socket.id, name: p.name } : null;
     }).filter(x => x);
     io.to(roomId).emit('waitingList', waiting);
+    }
+    // Handle Texas Hold 'Em disconnection
+    else if (gameType === 'texasHoldEm' && holdEmPlayerData[roomId]) {
+      if (holdEmPlayerData[roomId][socket.id]) {
+        delete holdEmPlayerData[roomId][socket.id];
+      }
+
+      // If player is in game, remove from active game
+      const game = holdEmGames[roomId];
+      if (game) {
+        game.players = game.players.filter(p => p.id !== socket.id);
+        game.activePlayers = game.activePlayers.filter(id => id !== socket.id);
+        game.foldedPlayers.delete(socket.id);
+        game.allInPlayers.delete(socket.id);
+
+        // If it was their turn, advance to next player
+        if (game.currentBettor === socket.id) {
+          const activePlayers = game.players.filter(p => !game.foldedPlayers.has(p.id));
+          if (activePlayers.length > 0) {
+            game.currentBettor = activePlayers[0].id;
+          }
+        }
+
+        // Broadcast player disconnection
+        io.to(roomId).emit('playerDisconnected', { socketId: socket.id });
+      }
+
+      // Clean up room if empty
+      if (Object.keys(holdEmPlayerData[roomId]).length === 0) {
+        delete holdEmGames[roomId];
+        delete holdEmPlayerData[roomId];
+        delete roomGameTypes[roomId];
+      }
+    }
   });
 });
 
