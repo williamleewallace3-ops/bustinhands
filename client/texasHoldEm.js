@@ -591,6 +591,7 @@ function addTexasHoldEmStyles() {
     .card {
       width: 60px;
       height: 80px;
+      background: white;
       border: 1px solid #333;
       border-radius: 4px;
       cursor: default;
