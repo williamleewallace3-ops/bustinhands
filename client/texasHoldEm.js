@@ -191,7 +191,6 @@ function displayPlayerHoleCards(playerId, cards) {
  * Create a card element (visual representation)
  */
 function createCardElement(card) {
-  const suitMap = { 'C': '♣', 'D': '♦', 'H': '♥', 'S': '♠' };
   const cardDiv = document.createElement('div');
   cardDiv.className = 'card';
   
@@ -208,12 +207,22 @@ function createCardElement(card) {
     suit = '?';
   }
   
-  const suitSymbol = suitMap[suit] || suit;
-  const displayText = `${rank}${suitSymbol}`;
+  // Map suit letters to full names for image paths
+  const suitNameMap = { 'C': 'clubs', 'D': 'diamonds', 'H': 'hearts', 'S': 'spades' };
+  const suitName = suitNameMap[suit] || 'clubs';
   
-  cardDiv.textContent = displayText;
+  // Create image path
+  const imagePath = `/cards/${rank}_of_${suitName}.png`;
+  
+  // Set background image
+  cardDiv.style.backgroundImage = `url('${imagePath}')`;
+  cardDiv.style.backgroundSize = 'cover';
+  cardDiv.style.backgroundPosition = 'center';
+  
   cardDiv.setAttribute('data-rank', rank);
   cardDiv.setAttribute('data-suit', suit);
+  
+  console.log(`Card image: ${imagePath}`);
   
   return cardDiv;
 }
@@ -564,15 +573,11 @@ function addTexasHoldEmStyles() {
     .card {
       width: 60px;
       height: 80px;
-      background: white;
-      border: 2px solid #333;
-      border-radius: 6px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: bold;
-      font-size: 14px;
+      border: 1px solid #333;
+      border-radius: 4px;
       cursor: default;
+      background-size: cover;
+      background-position: center;
     }
     
     .community-card {
