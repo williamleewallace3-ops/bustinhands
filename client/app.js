@@ -2527,10 +2527,10 @@ socket.on('dealCards', ({ holeCards }) => {
   displayGameMessage('Pre-flop betting round', 'info');
 });
 
-socket.on('gameState', ({ state, pot, communityCards, currentBettor, players }) => {
+socket.on('gameState', ({ state, pot, communityCards, currentBettor, highestBet, smallBlind, bigBlind, players }) => {
   if (selectedGame !== 'texasHoldEm') return;
   
-  console.log(`📊 Game state: ${state}, Pot: $${pot.toFixed(2)}`);
+  console.log(`📊 Game state: ${state}, Pot: $${pot.toFixed(2)}, Highest Bet: $${highestBet.toFixed(2)}`);
   
   // Update pot display
   updatePotDisplay(pot);
@@ -2559,12 +2559,12 @@ socket.on('gameState', ({ state, pot, communityCards, currentBettor, players }) 
   // Show betting controls if it's our turn
   if (currentBettor === mySocketId) {
     showBettingControls({ 
-      highestBet: 0, 
+      highestBet: highestBet,
       playerCurrentBet: players.find(p => p.id === mySocketId)?.currentBet || 0,
       pot: pot || 0,
       playerStack: players.find(p => p.id === mySocketId)?.stack || 0,
-      smallBlind: 0.05,
-      bigBlind: 0.10
+      smallBlind: smallBlind,
+      bigBlind: bigBlind
     });
   } else {
     hideBettingControls();

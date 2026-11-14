@@ -633,6 +633,9 @@ io.on('connection', (socket) => {
         pot: game.pot,
         communityCards: game.communityCards,
         currentBettor: game.currentBettor,
+        highestBet: game.highestBet,
+        smallBlind: game.smallBlind,
+        bigBlind: game.bigBlind,
         players: game.players.map(p => ({ id: p.id, name: p.name, stack: p.stack, currentBet: p.currentBet }))
       });
     }
