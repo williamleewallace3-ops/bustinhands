@@ -208,18 +208,18 @@ function showBettingControls(gameState) {
   foldBtn.style.display = 'none';
   betOptions.style.display = 'none';
   
-  // Always show fold button
-  foldBtn.style.display = 'inline-block';
-  
   // Calculate amount to call
   const amountToCall = gameState.highestBet - (gameState.playerCurrentBet || 0);
   
   if (gameState.highestBet === 0) {
-    // No bet yet - show check or bet
+    // No bet yet (first to act or at start of round) - show check or bet options
+    // Hide fold for first to act (nothing to fold to)
     checkBtn.style.display = 'inline-block';
     showBetSizingOptions(gameState, 'bet');
   } else {
-    // There's a bet - show call button and raise options
+    // There's a bet - show call, fold, and raise options
+    // Only show fold if there's actually a bet to fold to
+    foldBtn.style.display = 'inline-block';
     callBtn.style.display = 'inline-block';
     callBtn.textContent = `Call $${amountToCall.toFixed(2)}`;
     callBtn.dataset.amount = amountToCall.toFixed(2);
