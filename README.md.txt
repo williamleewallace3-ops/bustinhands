@@ -1,8 +1,8 @@
-# Chinese Poker - Video
+# Chinese Poker
 
 ## Requirements
 - Node.js installed
-- Chrome or Edge for video support
+- A modern web browser (Chrome, Edge, Firefox, Safari)
 
 ## Setup
 1. Copy the project folder to your computer

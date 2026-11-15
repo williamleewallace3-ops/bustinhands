@@ -1,7 +1,7 @@
 {
-  "name": "chinese-poker-video",
+  "name": "chinese-poker",
   "version": "1.0.0",
-  "description": "Chinese Poker - Video: Multiplayer web app with WebRTC video chat",
+  "description": "Chinese Poker: Multiplayer card game web app (Chinese Poker and Texas Hold'em)",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js"

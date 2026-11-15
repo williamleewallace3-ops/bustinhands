@@ -324,7 +324,7 @@ function emitTurn(roomId) {
     ? [...activePlayers.slice(currentIdx), ...activePlayers.slice(0, currentIdx)]
     : activePlayers;
   
-  // Gather all active player info with stats for video windows (in turn order)
+  // Gather all active player info with stats (in turn order)
   const players = orderedPlayers.map(player => {
     const stats = getOrCreatePlayer(player.name);
     const winPercent = stats.gamesPlayed > 0 
@@ -706,15 +706,14 @@ io.on('connection', (socket) => {
       
       // Auto-advance remaining streets with 3-second delays
       let streetCount = 0;
-      const maxStreets = game.state === 'preflop' ? 3 : game.state === 'flop' ? 2 : 1;
       
-      const autoAdvanceTimer = setInterval(() => {
+      const advanceAndBroadcast = () => {
         streetCount++;
         
         // Advance one street
         const isDone = texasHoldEmEngine.autoAdvanceOneStreet(game);
         
-        console.log(`🎰 Auto-advance street ${streetCount}/${maxStreets}, new state: ${game.state}`);
+        console.log(`🎰 Auto-advance street ${streetCount}, new state: ${game.state}`);
         
         // Broadcast updated state
         io.to(roomId).emit('gameStateUpdated', {
@@ -737,7 +736,6 @@ io.on('connection', (socket) => {
         
         // If we've reached showdown, stop and determine winner
         if (isDone) {
-          clearInterval(autoAdvanceTimer);
           console.log(`🎯 All streets dealt, determining winner...`);
           
           setTimeout(() => {
@@ -818,7 +816,17 @@ io.on('connection', (socket) => {
               }
             }, 3000);
           }, 3000);
+        } else {
+          // Schedule next street reveal in 3 seconds
+          setTimeout(() => {
+            advanceAndBroadcast();
+          }, 3000);
         }
+      };
+      
+      // Start the auto-advance sequence with 3-second initial delay
+      setTimeout(() => {
+        advanceAndBroadcast();
       }, 3000);
       
       return;
@@ -1542,30 +1550,6 @@ if (!firstPlayDone[roomId]) {
 
     // Otherwise advance turn normally
     advanceTurn(roomId, socket.id);
-  });
-
-  /* ===============================
-     WEBRTC SIGNALING
-  ================================ */
-  socket.on('offer', ({ to, offer }) => {
-    io.to(to).emit('offer', { from: socket.id, offer });
-  });
-
-  socket.on('answer', ({ to, answer }) => {
-    io.to(to).emit('answer', { from: socket.id, answer });
-  });
-
-  socket.on('ice-candidate', ({ to, candidate }) => {
-    io.to(to).emit('ice-candidate', { from: socket.id, candidate });
-  });
-
-  socket.on('requestOffer', ({ to }) => {
-    io.to(to).emit('requestOffer', { from: socket.id });
-  });
-
-  socket.on('getPlayerStats', ({ playerName }) => {
-    const stats = getOrCreatePlayer(playerName);
-    socket.emit('playerStats', { playerName, stats });
   });
 
   socket.on('disconnect', () => {

@@ -378,13 +378,14 @@ function advanceBetting(game) {
   // All active players must have acted
   const allActed = activePlayers.every(p => game.playersActedThisRound.has(p.id));
   
-  // All active players must have equal bets (or be all-in)
+  // All active players must have equal bets (or be all-in with $0 stack)
   const allEqual = activePlayers.every(p => 
-    p.currentBet === activePlayers[0].currentBet || game.allInPlayers.has(p.id)
+    p.currentBet === activePlayers[0].currentBet || p.stack === 0
   );
   
   // Check if only 1 player can still act (all others are all-in or folded)
-  const canActPlayers = activePlayers.filter(p => !game.allInPlayers.has(p.id));
+  // A player is all-in when their stack is $0
+  const canActPlayers = activePlayers.filter(p => p.stack > 0);
   const onlyOneCanAct = canActPlayers.length === 1;
   
   console.log(`✅ Next to act: ${game.players[nextIdx].name}`);
@@ -393,6 +394,7 @@ function advanceBetting(game) {
     const p = game.players.find(x => x.id === id);
     return p?.name || id;
   }).join(', ')}`);
+  console.log(`   player stacks: ${activePlayers.map(p => `${p.name}(${p.stack})`).join(', ')}`);
   
   // Check if only 1 player left - hand ends immediately
   if (activePlayers.length === 1) {
@@ -401,23 +403,18 @@ function advanceBetting(game) {
     return determineWinner(game);
   }
   
+  // Check if we need to auto-advance (only 1 player can act or all all-in)
+  // This must be checked BEFORE advanceStreet() because advanceStreet() resets playersActedThisRound
+  if (allActed && allEqual && canActPlayers.length <= 1 && game.state !== 'river') {
+    console.log(`🎯 Auto-dealing remaining streets (everyone all-in or no one can raise)...`);
+    advanceStreet(game);
+    return { autoAdvanceNeeded: true };
+  }
+  
   // End betting round if all active players have acted AND all have equal bets
   if (allActed && allEqual) {
     console.log(`🎯 Betting round complete, advancing to next street`);
     advanceStreet(game);
-  }
-  
-  // Auto-advance remaining streets if only 1 player can act and all bets are equal
-  // This handles the case where someone is all-in and no one else can raise
-  // BUT: only if that player has already acted this round
-  if (canActPlayers.length <= 1 && allEqual && game.state !== 'river') {
-    // If no one can act (all all-in), or if the one who can act has already acted
-    const onlyPlayerHasActed = canActPlayers.length === 0 || game.playersActedThisRound.has(canActPlayers[0].id);
-    
-    if (onlyPlayerHasActed) {
-      console.log(`🎯 Only 1 player can act (others all-in). Auto-dealing remaining streets...`);
-      return { autoAdvanceNeeded: true };
-    }
   }
 }
 
