@@ -15,6 +15,15 @@
             <button id="joinBtn">Join Game</button>
         </div>
         
+        <!-- GAME SELECTION SCREEN (hidden initially) -->
+        <div id="gameSelectOverlay" style="display:none;">
+            <div id="gameSelectContainer">
+                <h2>Select Your Game</h2>
+                <button id="chinesePokerBtn" class="gameSelectBtn">🃏 Chinese Poker</button>
+                <button id="texasHoldEmBtn" class="gameSelectBtn">🤠 Texas Hold 'Em</button>
+            </div>
+        </div>
+        
         <!-- SCENE SELECTION SCREEN (hidden initially) -->
         <div id="sceneOverlay" style="display:none;">
             <div id="sceneContainer">
@@ -71,27 +80,6 @@
 
         <div id="tableArea"></div>
 
-        <!-- VIDEO SIDE PANELS (draggable/resizable) -->
-        <!-- Active Players Panel -->
-        <div id="videoPanel" class="video-panel">
-            <div id="videoPanelHeader" class="video-panel-header">
-                Players
-            </div>
-            <div id="videoPanelContent" class="video-panel-content">
-                <!-- Active player video feeds will be dynamically added here -->
-            </div>
-        </div>
-
-        <!-- Waiting Room Panel -->
-        <div id="waitingPanel" class="video-panel waiting-panel" style="display:none;">
-            <div id="waitingPanelHeader" class="video-panel-header">
-                Waiting Room
-            </div>
-            <div id="waitingPanelContent" class="video-panel-content">
-                <!-- Waiting room player video feeds will be dynamically added here -->
-            </div>
-        </div>
-
         <!-- TURN INDICATOR -->
         <div id="turnIndicator" style="display:none;"></div>
 
@@ -115,6 +103,7 @@
 
 
     <script src="/socket.io/socket.io.js"></script>
+    <script src="texasHoldEm.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

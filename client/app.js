@@ -6,6 +6,8 @@ const socket = io();
 let mySocketId = null;
 let lastTurnPlayerId = null;
 let playerStatus = 'loading'; // 'active' or 'waiting'
+let currentGameState = null; // Store current game state for betting validation
+let foldedPlayersThisHand = new Set(); // Track which players have folded in current hand
 
 socket.on('connect', () => {
   mySocketId = socket.id;
@@ -2511,7 +2513,7 @@ socket.on('gameStarted', ({ players, blinds, dealerButton }) => {
       name: player.name,
       stack: player.stack,
       isCurrentBettor: false
-    });
+    }, players.length, players);
   });
   
   displayGameMessage('Game started! Dealing cards...', 'info');
@@ -2530,7 +2532,15 @@ socket.on('dealCards', ({ holeCards }) => {
 socket.on('gameState', ({ state, pot, communityCards, currentBettor, highestBet, smallBlind, bigBlind, players }) => {
   if (selectedGame !== 'texasHoldEm') return;
   
+  // Store current game state for betting validation
+  window.currentGameState = {
+    state, pot, communityCards, currentBettor, highestBet, smallBlind, bigBlind, players,
+    playerStack: players.find(p => p.id === mySocketId)?.stack || 0,
+    playerCurrentBet: players.find(p => p.id === mySocketId)?.currentBet || 0
+  };
+  
   console.log(`📊 Game state: ${state}, Pot: $${pot.toFixed(2)}, Highest Bet: $${highestBet.toFixed(2)}`);
+  console.log(`🔍 gameState currentBettor: ${currentBettor}, My ID: ${mySocketId}, players:`, players.map(p => `${p.name}(${p.id})`).join(', '));
   
   // Update pot display
   updatePotDisplay(pot);
@@ -2571,8 +2581,15 @@ socket.on('gameState', ({ state, pot, communityCards, currentBettor, highestBet,
   }
 });
 
-socket.on('gameStateUpdated', ({ state, pot, communityCards, currentBettor, highestBet, players }) => {
+socket.on('gameStateUpdated', ({ state, pot, communityCards, currentBettor, highestBet, smallBlind, bigBlind, players }) => {
   if (selectedGame !== 'texasHoldEm') return;
+  
+  // Store current game state for betting validation
+  window.currentGameState = {
+    state, pot, communityCards, currentBettor, highestBet, smallBlind, bigBlind, players,
+    playerStack: players.find(p => p.id === mySocketId)?.stack || 0,
+    playerCurrentBet: players.find(p => p.id === mySocketId)?.currentBet || 0
+  };
   
   console.log(`📊 State updated: ${state}`);
   
@@ -2595,7 +2612,16 @@ socket.on('gameStateUpdated', ({ state, pot, communityCards, currentBettor, high
     if (seatDiv) {
       seatDiv.classList.remove('folded', 'all-in', 'current-bettor');
       
-      if (player.folded) seatDiv.classList.add('folded');
+      if (player.folded) {
+        seatDiv.classList.add('folded');
+        // Trigger fold animation if player just folded
+        if (!foldedPlayersThisHand.has(player.id)) {
+          foldedPlayersThisHand.add(player.id);
+          if (typeof animateFoldCards === 'function') {
+            animateFoldCards(player.id);
+          }
+        }
+      }
       if (player.allIn) seatDiv.classList.add('all-in');
       if (player.id === currentBettor) seatDiv.classList.add('current-bettor');
       
@@ -2610,8 +2636,10 @@ socket.on('gameStateUpdated', ({ state, pot, communityCards, currentBettor, high
   });
   
   // Show/hide betting controls
+  console.log(`🎲 Current bettor: ${currentBettor}, My ID: ${mySocketId}, Should show controls: ${currentBettor === mySocketId}`);
   if (currentBettor === mySocketId) {
     const myPlayer = players.find(p => p.id === mySocketId);
+    console.log(`✅ Showing betting controls for ${myPlayer?.name}`);
     showBettingControls({ 
       highestBet: highestBet, 
       playerCurrentBet: myPlayer?.currentBet || 0,
@@ -2621,6 +2649,7 @@ socket.on('gameStateUpdated', ({ state, pot, communityCards, currentBettor, high
       bigBlind: bigBlind || 0.10
     });
   } else {
+    console.log(`❌ Hiding betting controls (waiting for ${currentBettor})`);
     hideBettingControls();
   }
 });
@@ -2661,17 +2690,25 @@ socket.on('newHandStarted', ({ pot, players }) => {
   
   console.log('🔄 New hand started');
   
+  // Reset folded players tracking for new hand
+  foldedPlayersThisHand.clear();
+  
   // Clear community cards
   const cardsList = document.getElementById('communityCardsList');
   if (cardsList) cardsList.innerHTML = '';
   
-  // Update player stacks
+  // Update player stacks and show their table cards
   players.forEach((player, index) => {
     const seatDiv = document.getElementById(`seat-${index}`);
     if (seatDiv) {
       seatDiv.classList.remove('folded', 'all-in');
       const stackDiv = seatDiv.querySelector('.player-stack');
       if (stackDiv) stackDiv.textContent = `$${player.stack.toFixed(2)}`;
+      
+      // Show table cards at the start of new hand
+      if (typeof showTableCards === 'function') {
+        showTableCards(player.id);
+      }
     }
   });
   
@@ -2769,8 +2806,10 @@ socket.on('playerRejoinedGame', ({ playerId, playerName, buyInAmount }) => {
 socket.on('disconnect', () => {
   console.log('❌ Disconnected from server');
   
-  // Stop monitoring feeds
-  stopFeedMonitor();
+  // Stop monitoring feeds (if function exists)
+  if (typeof stopFeedMonitor === 'function') {
+    stopFeedMonitor();
+  }
   
   // Close all peer connections
   Object.keys(peerConnections).forEach(socketId => {

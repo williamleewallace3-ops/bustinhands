@@ -18,14 +18,17 @@ function initializeTexasHoldEmUI() {
   holdEmContainer.id = 'holdEmContainer';
   holdEmContainer.className = 'holdem-container';
   
-  // Community cards area
+  // Top section: Community cards (centered)
+  const topSection = document.createElement('div');
+  topSection.className = 'top-section';
+  
   const communityArea = document.createElement('div');
   communityArea.id = 'communityCards';
   communityArea.className = 'community-cards';
   communityArea.innerHTML = `
-    <h3>Community Cards</h3>
     <div id="communityCardsList" class="card-list"></div>
   `;
+  topSection.appendChild(communityArea);
   
   // Pot area
   const potArea = document.createElement('div');
@@ -35,11 +38,16 @@ function initializeTexasHoldEmUI() {
     <div class="pot-label">Pot</div>
     <div id="potAmount" class="pot-amount">$0.00</div>
   `;
+  topSection.appendChild(potArea);
   
   // Player seating positions (will be dynamically populated)
   const seatingArea = document.createElement('div');
   seatingArea.id = 'seatingArea';
   seatingArea.className = 'seating-area';
+  
+  // Bottom section: Betting controls and player hole cards
+  const bottomSection = document.createElement('div');
+  bottomSection.className = 'bottom-section';
   
   // Betting controls area
   const bettingArea = document.createElement('div');
@@ -70,10 +78,20 @@ function initializeTexasHoldEmUI() {
     </div>
   `;
   
-  holdEmContainer.appendChild(communityArea);
-  holdEmContainer.appendChild(potArea);
+  // Player's hole cards area (below betting controls)
+  const playerHoleCardsArea = document.createElement('div');
+  playerHoleCardsArea.id = 'playerHoleCardsArea';
+  playerHoleCardsArea.className = 'player-hole-cards-area';
+  playerHoleCardsArea.innerHTML = `
+    <div id="playerHoleCardsList" class="player-hole-cards"></div>
+  `;
+  
+  bottomSection.appendChild(bettingArea);
+  bottomSection.appendChild(playerHoleCardsArea);
+  
+  holdEmContainer.appendChild(topSection);
   holdEmContainer.appendChild(seatingArea);
-  holdEmContainer.appendChild(bettingArea);
+  holdEmContainer.appendChild(bottomSection);
   
   tableArea.appendChild(holdEmContainer);
   
@@ -114,34 +132,54 @@ function updatePotDisplay(potAmount) {
 
 /**
  * Display player at seat
- * Current player (mySocketId) is always at bottom center
- * Other players positioned around relative to them
+ * Current player (mySocketId) is always at 6 o'clock (bottom center)
+ * Other players positioned around table based on their relative order
  */
-function displayPlayerAtSeat(seatNumber, playerInfo) {
+function displayPlayerAtSeat(seatNumber, playerInfo, totalPlayers = 2, allPlayers = []) {
   let seatingArea = document.getElementById('seatingArea');
   if (!seatingArea) return;
   
   // Determine position based on whether this is the current player
-  let position = 'bottom'; // Default for current player
+  let position = '6'; // Default for current player (6 o'clock)
   
-  // If this is not the current player, position them around the table in a circle
-  // Only use positions that don't overlap with dealer/table center (avoid 11, 12, 1 o'clock)
+  // If this is not the current player, position them around the table
   if (playerInfo.id !== mySocketId) {
-    // Create circular positions around the table (current player is at bottom center)
-    // Positions: bottom-right, right, bottom-left, left (avoiding top)
-    const positions = [
-      'bottom-right',   // 0 - 4-5 o'clock
-      'right',          // 1 - 3 o'clock
-      'bottom-left',    // 2 - 7-8 o'clock
-      'left',           // 3 - 9 o'clock
-    ];
-    position = positions[seatNumber % 4];
+    // Find the current player's position in the array
+    const myIndex = allPlayers.findIndex(p => p.id === mySocketId);
+    
+    // Calculate this player's offset from current player (clockwise)
+    let offset = (seatNumber - myIndex + totalPlayers) % totalPlayers;
+    
+    // Seating chart: map offset positions to clock positions
+    // This ensures each player sees themselves at 6, and others positioned accordingly
+    const seatingCharts = {
+      2: [6, 9],                          // offset 0 @ 6, offset 1 @ 9
+      3: [6, 9, 3],                       // offset 0 @ 6, offset 1 @ 9, offset 2 @ 3
+      4: [6, 8, 10, 3],                   // offset 0 @ 6, offset 1 @ 8, offset 2 @ 10, offset 3 @ 3
+      5: [6, 8, 10, 2, 4],                // offset 0 @ 6, offset 1 @ 8, offset 2 @ 10, offset 3 @ 2, offset 4 @ 4
+      6: [6, 8, 9, 10, 2, 4],             // etc.
+      7: [6, 8, 9, 10, 2, 3, 4],
+      8: [6, 7, 8, 9, 10, 2, 3, 4],
+      9: [6, 7, 8, 9, 10, 2, 3, 4, 5]
+    };
+    
+    const chart = seatingCharts[totalPlayers] || seatingCharts[2];
+    position = chart[offset] ? String(chart[offset]) : '6';
   }
   
   // Create seat element
   const seatDiv = document.createElement('div');
-  seatDiv.className = `player-seat seat-${position}`;
+  seatDiv.className = `player-seat seat-${position}-oclock`;
   seatDiv.id = `seat-${seatNumber}`;
+  
+  // Only create seat-table-cards for OTHER players
+  const tableCardsHTML = playerInfo.id !== mySocketId ? `
+    <div class="seat-table-cards" id="table-cards-${playerInfo.id}" data-position="${position}">
+      <div class="table-card"></div>
+      <div class="table-card"></div>
+    </div>
+  ` : '';
+  
   seatDiv.innerHTML = `
     <div class="seat-info">
       <div class="player-name">${playerInfo.name}</div>
@@ -149,9 +187,18 @@ function displayPlayerAtSeat(seatNumber, playerInfo) {
       <div class="player-current-bet" id="bet-${playerInfo.id}" style="display:none;">
         Bet: $<span>0</span>
       </div>
-      <div class="player-hole-cards" id="hole-cards-${playerInfo.id}"></div>
+      ${tableCardsHTML}
     </div>
   `;
+  
+  // Set card back image on table cards for OTHER players only
+  if (playerInfo.id !== mySocketId) {
+    const cardBackImage = `/cards/card_back${window.selectedDeck === '2' ? '2' : ''}.png`;
+    const tableCards = seatDiv.querySelectorAll('.table-card');
+    tableCards.forEach(card => {
+      card.style.backgroundImage = `url('${cardBackImage}')`;
+    });
+  }
   
   // Highlight if it's their turn
   if (playerInfo.isCurrentBettor) {
@@ -162,17 +209,17 @@ function displayPlayerAtSeat(seatNumber, playerInfo) {
 }
 
 /**
- * Display player's hole cards (only for self)
+ * Display player's hole cards (only for self, displayed below betting controls)
  */
 function displayPlayerHoleCards(playerId, cards) {
-  const holesCardsDiv = document.getElementById(`hole-cards-${playerId}`);
-  if (!holesCardsDiv) {
-    console.warn(`Hole cards container not found for player ${playerId}`);
+  const playerHoleCardsList = document.getElementById('playerHoleCardsList');
+  if (!playerHoleCardsList) {
+    console.warn(`Player hole cards container not found`);
     return;
   }
   
   console.log(`Displaying ${cards?.length || 0} hole cards for player ${playerId}:`, cards);
-  holesCardsDiv.innerHTML = '';
+  playerHoleCardsList.innerHTML = '';
   
   if (!cards || !Array.isArray(cards)) {
     console.warn('Invalid cards data:', cards);
@@ -183,7 +230,47 @@ function displayPlayerHoleCards(playerId, cards) {
     const cardEl = createCardElement(card);
     cardEl.classList.add('hole-card');
     console.log(`Added card ${index}:`, card, '-> Element text:', cardEl.textContent);
-    holesCardsDiv.appendChild(cardEl);
+    playerHoleCardsList.appendChild(cardEl);
+  });
+}
+
+/**
+ * Animate cards folding to center when player folds
+ * Cards slide to center from their position around the table
+ */
+function animateFoldCards(playerId) {
+  const tableCardsContainer = document.getElementById(`table-cards-${playerId}`);
+  if (!tableCardsContainer) return;
+  
+  // Get the position of the folding player (2, 3, 4, 5, 6, 7, 8, 9, 10)
+  const position = tableCardsContainer.getAttribute('data-position');
+  
+  const tableCards = tableCardsContainer.querySelectorAll('.table-card');
+  tableCards.forEach(card => {
+    // Add the position-specific animation class
+    card.classList.add(`fold-${position}-oclock`);
+  });
+  
+  // After animation completes, hide the container
+  setTimeout(() => {
+    tableCardsContainer.style.display = 'none';
+  }, 800);
+}
+
+/**
+ * Show table cards for players still in hand
+ */
+function showTableCards(playerId) {
+  const tableCardsContainer = document.getElementById(`table-cards-${playerId}`);
+  if (!tableCardsContainer) return;
+  
+  tableCardsContainer.style.display = 'flex';
+  const tableCards = tableCardsContainer.querySelectorAll('.table-card');
+  tableCards.forEach(card => {
+    // Remove all position-specific fold animation classes
+    card.classList.remove('fold-2-oclock', 'fold-3-oclock', 'fold-4-oclock', 
+                           'fold-5-oclock', 'fold-6-oclock', 'fold-7-oclock', 
+                           'fold-8-oclock', 'fold-9-oclock', 'fold-10-oclock');
   });
 }
 
@@ -249,12 +336,18 @@ function createCardElement(card) {
  * Show betting controls for current player
  */
 function showBettingControls(gameState) {
+  const bettingControls = document.getElementById('bettingControls');
   const checkBtn = document.getElementById('checkBtn');
   const callBtn = document.getElementById('callBtn');
   const foldBtn = document.getElementById('foldBtn');
   const betOptions = document.getElementById('betOptions');
   
-  // Hide all by default
+  // Show the betting controls container
+  if (bettingControls) {
+    bettingControls.style.display = 'block';
+  }
+  
+  // Hide all buttons by default
   checkBtn.style.display = 'none';
   callBtn.style.display = 'none';
   foldBtn.style.display = 'none';
@@ -263,14 +356,12 @@ function showBettingControls(gameState) {
   // Calculate amount to call
   const amountToCall = gameState.highestBet - (gameState.playerCurrentBet || 0);
   
-  if (gameState.highestBet === 0) {
-    // No bet yet (first to act or at start of round) - show check or bet options
-    // Hide fold for first to act (nothing to fold to)
+  if (amountToCall === 0) {
+    // Nothing to call - show check or bet options
     checkBtn.style.display = 'inline-block';
     showBetSizingOptions(gameState, 'bet');
   } else {
-    // There's a bet - show call, fold, and raise options
-    // Only show fold if there's actually a bet to fold to
+    // There's a bet to call - show call, fold, and raise options
     foldBtn.style.display = 'inline-block';
     callBtn.style.display = 'inline-block';
     callBtn.textContent = `Call $${amountToCall.toFixed(2)}`;
@@ -288,18 +379,47 @@ function showBetSizingOptions(gameState, betType) {
   const playerStack = gameState.playerStack || 0;
   const smallBlind = gameState.smallBlind || 0.05;
   const bigBlind = gameState.bigBlind || 0.10;
-  const minBet = bigBlind;
+  const playerCurrentBet = gameState.playerCurrentBet || 0;
+  const highestBet = gameState.highestBet || 0;
   
-  // Calculate bet sizes
-  const betSizes = {
-    min: minBet,
-    '1/4': pot / 4,
-    '1/3': pot / 3,
-    '1/2': pot / 2,
-    pot: pot,
-    '2x': pot * 2,
-    allin: playerStack
-  };
+  // For raises, minimum must be at least the previous bet amount
+  let minBet;
+  if (betType === 'raise') {
+    // Minimum raise is the highest bet in the pot
+    minBet = highestBet;
+  } else {
+    // For initial bets, minimum is big blind
+    minBet = bigBlind;
+  }
+  
+  // Maximum is player's remaining stack
+  const maxBet = playerStack;
+  
+  // Calculate bet sizes (don't enforce minimums - just hide illegal ones)
+  let betSizes;
+  if (betType === 'raise') {
+    // For raises, add highestBet to the bet sizes (since we're matching + raising)
+    betSizes = {
+      min: minBet,
+      '1/4': highestBet + (pot / 4),
+      '1/3': highestBet + (pot / 3),
+      '1/2': highestBet + (pot / 2),
+      pot: highestBet + pot,
+      '2x': highestBet + (pot * 2),
+      allin: playerStack + playerCurrentBet
+    };
+  } else {
+    // For initial bets, bet sizes are just multiples of the pot
+    betSizes = {
+      min: minBet,
+      '1/4': pot / 4,
+      '1/3': pot / 3,
+      '1/2': pot / 2,
+      pot: pot,
+      '2x': pot * 2,
+      allin: playerStack
+    };
+  }
   
   // Show bet sizing options
   const betMinBtn = document.getElementById('betMinBtn');
@@ -312,72 +432,89 @@ function showBetSizingOptions(gameState, betType) {
   const customBetBtn = document.getElementById('customBetBtn');
   const customBetAmount = document.getElementById('customBetAmount');
   
-  // Show Min button
+  // Show Min button (only if it's legal)
   if (betMinBtn) {
-    betMinBtn.style.display = 'inline-block';
-    betMinBtn.textContent = `Min ($${minBet.toFixed(2)})`;
-    betMinBtn.dataset.amount = minBet.toFixed(2);
+    if (minBet <= maxBet && minBet > 0) {
+      betMinBtn.style.display = 'inline-block';
+      betMinBtn.textContent = `Min ($${minBet.toFixed(2)})`;
+      betMinBtn.dataset.amount = minBet.toFixed(2);
+    } else {
+      betMinBtn.style.display = 'none';
+    }
   }
   
-  // Show 1/4 pot
-  if (bet1_4Btn && betSizes['1/4'] > 0) {
-    bet1_4Btn.style.display = 'inline-block';
-    bet1_4Btn.textContent = `1/4 Pot ($${betSizes['1/4'].toFixed(2)})`;
-    bet1_4Btn.dataset.amount = betSizes['1/4'].toFixed(2);
-  } else if (bet1_4Btn) {
-    bet1_4Btn.style.display = 'none';
+  // Show 1/4 pot (only if legal - must be >= minBet and <= maxBet)
+  if (bet1_4Btn) {
+    if (betSizes['1/4'] >= minBet && betSizes['1/4'] <= maxBet && betSizes['1/4'] > 0) {
+      bet1_4Btn.style.display = 'inline-block';
+      bet1_4Btn.textContent = `1/4 Pot ($${betSizes['1/4'].toFixed(2)})`;
+      bet1_4Btn.dataset.amount = betSizes['1/4'].toFixed(2);
+    } else {
+      bet1_4Btn.style.display = 'none';
+    }
   }
   
-  // Show 1/3 pot
-  if (bet1_3Btn && betSizes['1/3'] > 0) {
-    bet1_3Btn.style.display = 'inline-block';
-    bet1_3Btn.textContent = `1/3 Pot ($${betSizes['1/3'].toFixed(2)})`;
-    bet1_3Btn.dataset.amount = betSizes['1/3'].toFixed(2);
-  } else if (bet1_3Btn) {
-    bet1_3Btn.style.display = 'none';
+  // Show 1/3 pot (only if legal)
+  if (bet1_3Btn) {
+    if (betSizes['1/3'] >= minBet && betSizes['1/3'] <= maxBet && betSizes['1/3'] > 0) {
+      bet1_3Btn.style.display = 'inline-block';
+      bet1_3Btn.textContent = `1/3 Pot ($${betSizes['1/3'].toFixed(2)})`;
+      bet1_3Btn.dataset.amount = betSizes['1/3'].toFixed(2);
+    } else {
+      bet1_3Btn.style.display = 'none';
+    }
   }
   
-  // Show 1/2 pot
-  if (bet1_2Btn && betSizes['1/2'] > 0) {
-    bet1_2Btn.style.display = 'inline-block';
-    bet1_2Btn.textContent = `1/2 Pot ($${betSizes['1/2'].toFixed(2)})`;
-    bet1_2Btn.dataset.amount = betSizes['1/2'].toFixed(2);
-  } else if (bet1_2Btn) {
-    bet1_2Btn.style.display = 'none';
+  // Show 1/2 pot (only if legal)
+  if (bet1_2Btn) {
+    if (betSizes['1/2'] >= minBet && betSizes['1/2'] <= maxBet && betSizes['1/2'] > 0) {
+      bet1_2Btn.style.display = 'inline-block';
+      bet1_2Btn.textContent = `1/2 Pot ($${betSizes['1/2'].toFixed(2)})`;
+      bet1_2Btn.dataset.amount = betSizes['1/2'].toFixed(2);
+    } else {
+      bet1_2Btn.style.display = 'none';
+    }
   }
   
-  // Show pot
-  if (betPotBtn && betSizes.pot > 0) {
-    betPotBtn.style.display = 'inline-block';
-    betPotBtn.textContent = `Pot ($${betSizes.pot.toFixed(2)})`;
-    betPotBtn.dataset.amount = betSizes.pot.toFixed(2);
-  } else if (betPotBtn) {
-    betPotBtn.style.display = 'none';
+  // Show pot (only if legal)
+  if (betPotBtn) {
+    if (betSizes.pot >= minBet && betSizes.pot <= maxBet && betSizes.pot > 0) {
+      betPotBtn.style.display = 'inline-block';
+      betPotBtn.textContent = `Pot ($${betSizes.pot.toFixed(2)})`;
+      betPotBtn.dataset.amount = betSizes.pot.toFixed(2);
+    } else {
+      betPotBtn.style.display = 'none';
+    }
   }
   
-  // Show 2x pot
-  if (bet2xBtn && betSizes['2x'] > 0) {
-    bet2xBtn.style.display = 'inline-block';
-    bet2xBtn.textContent = `2x Pot ($${betSizes['2x'].toFixed(2)})`;
-    bet2xBtn.dataset.amount = betSizes['2x'].toFixed(2);
-  } else if (bet2xBtn) {
-    bet2xBtn.style.display = 'none';
+  // Show 2x pot (only if legal)
+  if (bet2xBtn) {
+    if (betSizes['2x'] >= minBet && betSizes['2x'] <= maxBet && betSizes['2x'] > 0) {
+      bet2xBtn.style.display = 'inline-block';
+      bet2xBtn.textContent = `2x Pot ($${betSizes['2x'].toFixed(2)})`;
+      bet2xBtn.dataset.amount = betSizes['2x'].toFixed(2);
+    } else {
+      bet2xBtn.style.display = 'none';
+    }
   }
   
-  // Show all-in
-  if (betAllInBtn && playerStack > 0) {
-    betAllInBtn.style.display = 'inline-block';
-    betAllInBtn.textContent = `All-In ($${playerStack.toFixed(2)})`;
-    betAllInBtn.dataset.amount = playerStack.toFixed(2);
-  } else if (betAllInBtn) {
-    betAllInBtn.style.display = 'none';
+  // Show all-in (always available if player has chips and it's >= minBet)
+  if (betAllInBtn) {
+    if (playerStack >= minBet && playerStack > 0) {
+      betAllInBtn.style.display = 'inline-block';
+      betAllInBtn.textContent = `All-In ($${playerStack.toFixed(2)})`;
+      betAllInBtn.dataset.amount = playerStack.toFixed(2);
+    } else {
+      betAllInBtn.style.display = 'none';
+    }
   }
   
-  // Show custom bet option
+  // Show custom bet option with validation
   if (customBetBtn) {
     customBetBtn.style.display = 'inline-block';
     customBetAmount.style.display = 'inline-block';
     customBetAmount.value = '';
+    customBetAmount.placeholder = `Min: $${minBet.toFixed(2)}, Max: $${maxBet.toFixed(2)}`;
   }
   
   // Show confirm and cancel buttons for custom
@@ -517,9 +654,41 @@ function attachTexasHoldEmListeners() {
     const customInput = document.getElementById('customBetAmount');
     const amount = parseFloat(customInput.value) || 0;
     const actionType = document.getElementById('betOptions').dataset.actionType || 'bet';
+    const gameState = window.currentGameState;
+    
+    if (!gameState) {
+      alert('Game state not available');
+      return;
+    }
+    
+    // Validate the bet amount
+    const playerStack = gameState.playerStack || 0;
+    const highestBet = gameState.highestBet || 0;
+    let minBet;
+    
+    if (actionType === 'raise') {
+      minBet = highestBet;
+    } else {
+      minBet = gameState.bigBlind || 0.10;
+    }
+    
+    const maxBet = playerStack;
     
     if (amount <= 0) {
       alert('Please enter a valid amount');
+      customInput.focus();
+      return;
+    }
+    
+    if (amount < minBet) {
+      alert(`Minimum bet is $${minBet.toFixed(2)}`);
+      customInput.focus();
+      return;
+    }
+    
+    if (amount > maxBet) {
+      alert(`Maximum bet is $${maxBet.toFixed(2)}`);
+      customInput.focus();
       return;
     }
     
@@ -540,9 +709,8 @@ function playerAction(action, amount = 0) {
   
   console.log(`🎯 Action: ${action}`, amount > 0 ? `$${amount.toFixed(2)}` : '');
   
-  // Hide betting options after action
-  const betOptions = document.getElementById('betOptions');
-  if (betOptions) betOptions.style.display = 'none';
+  // Don't hide betting options immediately - let server response determine visibility
+  // The server will send gameStateUpdated to update the UI
   
   socket.emit('pokerAction', {
     roomId,
@@ -566,20 +734,26 @@ function addTexasHoldEmStyles() {
       display: flex;
       flex-direction: column;
       align-items: center;
-      justify-content: space-between;
+      justify-content: center;
       padding: 20px;
       position: relative;
     }
     
-    .community-cards {
-      text-align: center;
-      margin-bottom: 20px;
+    /* Top section with community cards and pot - centered in middle */
+    .top-section {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 15px;
+      justify-content: center;
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
     }
     
-    .community-cards h3 {
-      color: white;
-      font-size: 18px;
-      margin: 0 0 10px 0;
+    .community-cards {
+      text-align: center;
     }
     
     .card-list {
@@ -603,18 +777,11 @@ function addTexasHoldEmStyles() {
       transform: scale(1.1);
     }
     
-    .hole-card {
-      width: 50px;
-      height: 70px;
-      margin: 0 2px;
-    }
-    
     .pot-display {
       text-align: center;
       background: rgba(0, 0, 0, 0.5);
       padding: 15px 30px;
       border-radius: 10px;
-      margin-bottom: 20px;
     }
     
     .pot-label {
@@ -631,11 +798,16 @@ function addTexasHoldEmStyles() {
       margin-top: 5px;
     }
     
+    /* Seating area in the middle */
     .seating-area {
-      position: relative;
+      position: absolute;
       width: 100%;
-      height: 300px;
-      margin: 20px 0;
+      height: 400px;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      perspective: 1000px;
     }
     
     .player-seat {
@@ -657,39 +829,14 @@ function addTexasHoldEmStyles() {
       background: rgba(80, 80, 90, 0.9);
     }
     
-    /* Current player - bottom center */
-    .player-seat.seat-bottom { 
-      bottom: 10px; 
-      left: 50%; 
-      transform: translateX(-50%); 
-    }
-    
-    /* Side positions only - avoid top where dealer image is */
-    .player-seat.seat-bottom-right { 
-      bottom: 60px; 
-      right: 40px; 
-    }
-    
-    .player-seat.seat-right { 
-      right: 10px; 
-      top: 50%; 
-      transform: translateY(-50%); 
-    }
-    
-    .player-seat.seat-bottom-left { 
-      bottom: 60px; 
-      left: 40px; 
-    }
-    
-    .player-seat.seat-left { 
-      left: 10px; 
-      top: 50%; 
-      transform: translateY(-50%); 
+    .seat-info {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
     }
     
     .player-name {
       font-weight: bold;
-      margin-bottom: 5px;
     }
     
     .player-stack {
@@ -700,21 +847,236 @@ function addTexasHoldEmStyles() {
     .player-current-bet {
       font-size: 10px;
       color: #ffaa00;
-      margin-top: 3px;
     }
     
-    .player-hole-cards {
+    /* Face-down cards displayed at player's seat */
+    .seat-table-cards {
       display: flex;
       justify-content: center;
-      gap: 2px;
+      gap: 3px;
       margin-top: 5px;
+    }
+    
+    .table-card {
+      width: 30px;
+      height: 40px;
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      border-radius: 2px;
+      background-size: cover;
+      background-position: center;
+      background-repeat: no-repeat;
+    }
+    
+    /* Position-specific fold animations - cards slide from their seat to center */
+    
+    /* 2 o'clock position - top right, slide down-left to center */
+    .table-card.fold-2-oclock {
+      animation: cardFold2 0.8s ease-out forwards;
+      opacity: 0;
+    }
+    
+    @keyframes cardFold2 {
+      0% {
+        transform: translate(0, 0) scale(1) rotateY(0deg);
+        opacity: 1;
+      }
+      50% {
+        transform: translate(-75px, 75px) scale(0.7) rotateY(90deg);
+        opacity: 0.8;
+      }
+      100% {
+        transform: translate(-150px, 150px) scale(0.1) rotateY(180deg);
+        opacity: 0;
+      }
+    }
+    
+    /* 3 o'clock position - right side, slide left to center */
+    .table-card.fold-3-oclock {
+      animation: cardFold3 0.8s ease-out forwards;
+      opacity: 0;
+    }
+    
+    @keyframes cardFold3 {
+      0% {
+        transform: translate(0, 0) scale(1) rotateY(0deg);
+        opacity: 1;
+      }
+      50% {
+        transform: translate(-100px, 0) scale(0.7) rotateY(90deg);
+        opacity: 0.8;
+      }
+      100% {
+        transform: translate(-200px, 0) scale(0.1) rotateY(180deg);
+        opacity: 0;
+      }
+    }
+    
+    /* 4 o'clock position - bottom right, slide up-left to center */
+    .table-card.fold-4-oclock {
+      animation: cardFold4 0.8s ease-out forwards;
+      opacity: 0;
+    }
+    
+    @keyframes cardFold4 {
+      0% {
+        transform: translate(0, 0) scale(1) rotateY(0deg);
+        opacity: 1;
+      }
+      50% {
+        transform: translate(-75px, -75px) scale(0.7) rotateY(90deg);
+        opacity: 0.8;
+      }
+      100% {
+        transform: translate(-150px, -150px) scale(0.1) rotateY(180deg);
+        opacity: 0;
+      }
+    }
+    
+    /* 5 o'clock position - bottom right near center, slide up-left to center */
+    .table-card.fold-5-oclock {
+      animation: cardFold5 0.8s ease-out forwards;
+      opacity: 0;
+    }
+    
+    @keyframes cardFold5 {
+      0% {
+        transform: translate(0, 0) scale(1) rotateY(0deg);
+        opacity: 1;
+      }
+      50% {
+        transform: translate(-50px, -50px) scale(0.7) rotateY(90deg);
+        opacity: 0.8;
+      }
+      100% {
+        transform: translate(-100px, -100px) scale(0.1) rotateY(180deg);
+        opacity: 0;
+      }
+    }
+    
+    /* 6 o'clock position - bottom center, slide up to center (current player, typically hidden) */
+    .table-card.fold-6-oclock {
+      animation: cardFold6 0.8s ease-out forwards;
+      opacity: 0;
+    }
+    
+    @keyframes cardFold6 {
+      0% {
+        transform: translate(0, 0) scale(1) rotateY(0deg);
+        opacity: 1;
+      }
+      50% {
+        transform: translate(0, -75px) scale(0.7) rotateY(90deg);
+        opacity: 0.8;
+      }
+      100% {
+        transform: translate(0, -150px) scale(0.1) rotateY(180deg);
+        opacity: 0;
+      }
+    }
+    
+    /* 7 o'clock position - bottom left near center, slide up-right to center */
+    .table-card.fold-7-oclock {
+      animation: cardFold7 0.8s ease-out forwards;
+      opacity: 0;
+    }
+    
+    @keyframes cardFold7 {
+      0% {
+        transform: translate(0, 0) scale(1) rotateY(0deg);
+        opacity: 1;
+      }
+      50% {
+        transform: translate(50px, -50px) scale(0.7) rotateY(90deg);
+        opacity: 0.8;
+      }
+      100% {
+        transform: translate(100px, -100px) scale(0.1) rotateY(180deg);
+        opacity: 0;
+      }
+    }
+    
+    /* 8 o'clock position - bottom left, slide up-right to center */
+    .table-card.fold-8-oclock {
+      animation: cardFold8 0.8s ease-out forwards;
+      opacity: 0;
+    }
+    
+    @keyframes cardFold8 {
+      0% {
+        transform: translate(0, 0) scale(1) rotateY(0deg);
+        opacity: 1;
+      }
+      50% {
+        transform: translate(75px, -75px) scale(0.7) rotateY(90deg);
+        opacity: 0.8;
+      }
+      100% {
+        transform: translate(150px, -150px) scale(0.1) rotateY(180deg);
+        opacity: 0;
+      }
+    }
+    
+    /* 9 o'clock position - left side, slide right to center */
+    .table-card.fold-9-oclock {
+      animation: cardFold9 0.8s ease-out forwards;
+      opacity: 0;
+    }
+    
+    @keyframes cardFold9 {
+      0% {
+        transform: translate(0, 0) scale(1) rotateY(0deg);
+        opacity: 1;
+      }
+      50% {
+        transform: translate(100px, 0) scale(0.7) rotateY(90deg);
+        opacity: 0.8;
+      }
+      100% {
+        transform: translate(200px, 0) scale(0.1) rotateY(180deg);
+        opacity: 0;
+      }
+    }
+    
+    /* 10 o'clock position - top left, slide down-right to center */
+    .table-card.fold-10-oclock {
+      animation: cardFold10 0.8s ease-out forwards;
+      opacity: 0;
+    }
+    
+    @keyframes cardFold10 {
+      0% {
+        transform: translate(0, 0) scale(1) rotateY(0deg);
+        opacity: 1;
+      }
+      50% {
+        transform: translate(75px, 75px) scale(0.7) rotateY(90deg);
+        opacity: 0.8;
+      }
+      100% {
+        transform: translate(150px, 150px) scale(0.1) rotateY(180deg);
+        opacity: 0;
+      }
+    }
+    
+    /* Bottom section with betting controls and player's hole cards */
+    .bottom-section {
+      position: absolute;
+      bottom: 20px;
+      left: 0;
+      right: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 15px;
+      padding-top: 20px;
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
     }
     
     .betting-controls {
       display: flex;
       flex-direction: column;
       gap: 10px;
-      margin-top: 20px;
+      align-items: center;
     }
     
     .action-buttons {
@@ -834,6 +1196,83 @@ function addTexasHoldEmStyles() {
     
     .cancel-btn:hover {
       background: #777;
+    }
+    
+    /* Player's own hole cards - displayed below betting controls */
+    .player-hole-cards-area {
+      display: flex;
+      justify-content: center;
+      gap: 10px;
+    }
+    
+    .player-hole-cards {
+      display: flex;
+      justify-content: center;
+      gap: 5px;
+    }
+    
+    .hole-card {
+      width: 60px;
+      height: 80px;
+      margin: 0 2px;
+    }
+    
+    /* Clock-based player positioning around the table */
+    /* Current player - 6 o'clock (bottom center) */
+    .player-seat.seat-6-oclock { 
+      bottom: 10px; 
+      left: 50%; 
+      transform: translateX(-50%); 
+    }
+    
+    /* 2 o'clock - upper right */
+    .player-seat.seat-2-oclock {
+      top: 20px;
+      right: 30px;
+    }
+    
+    /* 3 o'clock - right */
+    .player-seat.seat-3-oclock {
+      right: 10px;
+      top: 50%;
+      transform: translateY(-50%);
+    }
+    
+    /* 4 o'clock - lower right */
+    .player-seat.seat-4-oclock {
+      bottom: 60px;
+      right: 40px;
+    }
+    
+    /* 5 o'clock - lower right near bottom */
+    .player-seat.seat-5-oclock {
+      bottom: 30px;
+      right: 70px;
+    }
+    
+    /* 7 o'clock - lower left near bottom */
+    .player-seat.seat-7-oclock {
+      bottom: 30px;
+      left: 70px;
+    }
+    
+    /* 8 o'clock - lower left */
+    .player-seat.seat-8-oclock {
+      bottom: 60px;
+      left: 40px;
+    }
+    
+    /* 9 o'clock - left */
+    .player-seat.seat-9-oclock {
+      left: 10px;
+      top: 50%;
+      transform: translateY(-50%);
+    }
+    
+    /* 10 o'clock - upper left */
+    .player-seat.seat-10-oclock {
+      top: 20px;
+      left: 30px;
     }
     
     .game-message {

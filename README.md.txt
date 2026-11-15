@@ -1,4 +1,4 @@
-# Chinese Poker Web App
+# Chinese Poker - Video
 
 ## Requirements
 - Node.js installed

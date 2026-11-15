@@ -628,6 +628,7 @@ io.on('connection', (socket) => {
       });
 
       // Broadcast community cards (none yet, but send state)
+      console.log(`📡 Sending initial gameState: currentBettor=${game.currentBettor}, players: ${game.players.map(p => `${p.name}(${p.id})`).join(', ')}`);
       io.to(roomId).emit('gameState', {
         state: game.state,
         pot: game.pot,
@@ -638,6 +639,7 @@ io.on('connection', (socket) => {
         bigBlind: game.bigBlind,
         players: game.players.map(p => ({ id: p.id, name: p.name, stack: p.stack, currentBet: p.currentBet }))
       });
+      console.log(`✅ gameState sent`);
     }
   });
 
@@ -645,7 +647,10 @@ io.on('connection', (socket) => {
    * Handle Texas Hold 'Em player actions (bet, call, fold, etc.)
    */
   socket.on('pokerAction', ({ roomId, gameType, action, amount }) => {
+    console.log(`♠️ pokerAction received: gameType=${gameType}, action=${action}, amount=${amount}`);
+    
     if (gameType !== 'texasHoldEm' || !holdEmGames[roomId]) {
+      console.log(`❌ Invalid game or no game found for ${roomId}`);
       socket.emit('errorMessage', 'Invalid game');
       return;
     }
@@ -653,21 +658,169 @@ io.on('connection', (socket) => {
     const game = holdEmGames[roomId];
     
     if (game.currentBettor !== socket.id) {
+      console.log(`❌ Not your turn. Current bettor: ${game.currentBettor}, Your ID: ${socket.id}`);
       socket.emit('errorMessage', 'Not your turn');
       return;
     }
 
     const player = game.players.find(p => p.id === socket.id);
     if (!player) {
+      console.log(`❌ Player not found`);
       socket.emit('errorMessage', 'Player not found');
       return;
     }
 
+    console.log(`✅ Processing action: ${action} for player ${player.name}`);
+    
     // Handle the action
     const result = texasHoldEmEngine.handlePlayerAction(game, socket.id, action, amount);
     
     if (result.error) {
+      console.log(`❌ Action error: ${result.error}`);
       socket.emit('errorMessage', result.error);
+      return;
+    }
+
+    // Check if we need to auto-advance remaining streets (all-in scenario)
+    if (result.autoAdvanceNeeded) {
+      console.log(`🎯 Auto-dealing remaining streets...`);
+      
+      // First, broadcast current state
+      io.to(roomId).emit('gameStateUpdated', {
+        state: game.state,
+        pot: game.pot,
+        communityCards: game.communityCards,
+        currentBettor: game.currentBettor,
+        highestBet: game.highestBet,
+        smallBlind: game.smallBlind,
+        bigBlind: game.bigBlind,
+        players: game.players.map(p => ({ 
+          id: p.id, 
+          name: p.name, 
+          stack: p.stack, 
+          currentBet: p.currentBet,
+          folded: game.foldedPlayers.has(p.id),
+          allIn: game.allInPlayers.has(p.id)
+        }))
+      });
+      
+      // Auto-advance remaining streets with 3-second delays
+      let streetCount = 0;
+      const maxStreets = game.state === 'preflop' ? 3 : game.state === 'flop' ? 2 : 1;
+      
+      const autoAdvanceTimer = setInterval(() => {
+        streetCount++;
+        
+        // Advance one street
+        const isDone = texasHoldEmEngine.autoAdvanceOneStreet(game);
+        
+        console.log(`🎰 Auto-advance street ${streetCount}/${maxStreets}, new state: ${game.state}`);
+        
+        // Broadcast updated state
+        io.to(roomId).emit('gameStateUpdated', {
+          state: game.state,
+          pot: game.pot,
+          communityCards: game.communityCards,
+          currentBettor: game.currentBettor,
+          highestBet: game.highestBet,
+          smallBlind: game.smallBlind,
+          bigBlind: game.bigBlind,
+          players: game.players.map(p => ({ 
+            id: p.id, 
+            name: p.name, 
+            stack: p.stack, 
+            currentBet: p.currentBet,
+            folded: game.foldedPlayers.has(p.id),
+            allIn: game.allInPlayers.has(p.id)
+          }))
+        });
+        
+        // If we've reached showdown, stop and determine winner
+        if (isDone) {
+          clearInterval(autoAdvanceTimer);
+          console.log(`🎯 All streets dealt, determining winner...`);
+          
+          setTimeout(() => {
+            const winnerResult = texasHoldEmEngine.determineWinner(game);
+            
+            io.to(roomId).emit('handComplete', {
+              winners: winnerResult.winners,
+              winnerNames: winnerResult.winnerNames,
+              pot: winnerResult.pot,
+              method: winnerResult.method,
+              allHands: winnerResult.allHands,
+              sidePotDistribution: winnerResult.sidePotDistribution,
+              winnings: winnerResult.winnings
+            });
+
+            // Check for busted players
+            for (const player of game.players) {
+              if (player.stack <= 0 && holdEmPlayerData[roomId][player.id]) {
+                holdEmPlayerData[roomId][player.id].status = 'busted';
+                holdEmPlayerData[roomId][player.id].stack = 0;
+                holdEmBustedPlayers[roomId] = holdEmBustedPlayers[roomId] || new Set();
+                holdEmBustedPlayers[roomId].add(player.id);
+                
+                // Notify busted player
+                const playerSocket = holdEmPlayerData[roomId][player.id].socket;
+                if (playerSocket) {
+                  playerSocket.emit('youBusted', {
+                    bustedAmount: player.stack,
+                    minRebuy: 1.00,
+                    maxRebuy: 1000.00,
+                    suggestedRebuy: 10.00
+                  });
+                }
+              }
+            }
+
+            // Reset for next hand
+            setTimeout(() => {
+              const activePlayers = game.players.filter(p => p.stack > 0);
+              
+              if (activePlayers.length < 2) {
+                console.log(`🤠 Waiting for rebuys in room ${roomId}`);
+                io.to(roomId).emit('waitingForRebuys', {
+                  activePlayers: activePlayers.map(p => ({ id: p.id, name: p.name, stack: p.stack })),
+                  bustOut: Array.from(holdEmBustedPlayers[roomId] || []).map(id => ({
+                    id,
+                    name: holdEmPlayerData[roomId][id]?.name
+                  }))
+                });
+              } else {
+                game.players = activePlayers;
+                texasHoldEmEngine.startNewHand(game);
+                
+                io.to(roomId).emit('newHandStarted', {
+                  pot: game.pot,
+                  players: game.players.map(p => ({ id: p.id, name: p.name, stack: p.stack }))
+                });
+
+                game.players.forEach(player => {
+                  const playerSocket = holdEmPlayerData[roomId][player.id]?.socket;
+                  if (playerSocket) {
+                    playerSocket.emit('dealCards', {
+                      holeCards: game.playerHands[player.id]
+                    });
+                  }
+                });
+
+                io.to(roomId).emit('gameState', {
+                  state: game.state,
+                  pot: game.pot,
+                  communityCards: game.communityCards,
+                  currentBettor: game.currentBettor,
+                  highestBet: game.highestBet,
+                  smallBlind: game.smallBlind,
+                  bigBlind: game.bigBlind,
+                  players: game.players.map(p => ({ id: p.id, name: p.name, stack: p.stack, currentBet: p.currentBet }))
+                });
+              }
+            }, 3000);
+          }, 3000);
+        }
+      }, 3000);
+      
       return;
     }
 
@@ -730,11 +883,36 @@ io.on('connection', (socket) => {
             pot: game.pot,
             players: game.players.map(p => ({ id: p.id, name: p.name, stack: p.stack }))
           });
+
+          // Send hole cards to each player
+          game.players.forEach(player => {
+            const playerSocket = holdEmPlayerData[roomId][player.id]?.socket;
+            if (playerSocket) {
+              playerSocket.emit('dealCards', {
+                holeCards: game.playerHands[player.id]
+              });
+            }
+          });
+
+          // Broadcast initial game state for new hand
+          console.log(`📡 Sending gameState for new hand: currentBettor=${game.currentBettor}, players: ${game.players.map(p => `${p.name}(${p.id})`).join(', ')}`);
+          io.to(roomId).emit('gameState', {
+            state: game.state,
+            pot: game.pot,
+            communityCards: game.communityCards,
+            currentBettor: game.currentBettor,
+            highestBet: game.highestBet,
+            smallBlind: game.smallBlind,
+            bigBlind: game.bigBlind,
+            players: game.players.map(p => ({ id: p.id, name: p.name, stack: p.stack, currentBet: p.currentBet }))
+          });
+          console.log(`✅ gameState sent for new hand`);
         }
       }, 3000);
     } else {
       // Broadcast game state update
       const myPlayerStack = game.players.find(p => p.id === socket.id)?.stack || 0;
+      console.log(`🎲 Broadcasting gameStateUpdated: currentBettor=${game.currentBettor}, state=${game.state}`);
       io.to(roomId).emit('gameStateUpdated', {
         state: game.state,
         pot: game.pot,
