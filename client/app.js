@@ -1562,7 +1562,6 @@ socket.on('dealCards', ({ holeCards }) => {
   playerCards = holeCards;
   
   displayPlayerHoleCards(mySocketId, holeCards);
-  displayGameMessage('Pre-flop betting round', 'info');
 });
 
 socket.on('gameState', ({ state, pot, communityCards, currentBettor, highestBet, minRaiseTo, smallBlind, bigBlind, dealerId, smallBlindId, bigBlindId, players }) => {
@@ -1760,8 +1759,6 @@ socket.on('newHandStarted', ({ pot, players }) => {
       }
     }
   });
-  
-  displayGameMessage('New hand starting...', 'info');
 });
 
 socket.on('blindsChanged', ({ smallBlind, bigBlind }) => {
