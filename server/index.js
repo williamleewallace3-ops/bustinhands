@@ -3,6 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 const { findBestHand, HAND_TYPE_RANK, rankValue, SUIT_RANK } = require('./utils');
 const texasHoldEmEngine = require('./texasHoldEmEngine');
 const firstPlayDone = {}; // roomId -> true/false
@@ -649,8 +650,11 @@ io.on('connection', (socket) => {
         playerName: socket.playerName,
         cards: game.playerHands[socket.id] || []
       });
+      const shown = (game.playerHands[socket.id] || []).map(c => `${c.rank}${c.suit}`).join(' ');
+      appendHandLog(`Hand #${game.handNumber}: ${socket.playerName} showed [${shown}]\n\n`);
       scheduleNextHoldEmHand(roomId, HOLDEM_SHOWN_CARDS_DELAY);
     } else {
+      appendHandLog(`Hand #${game.handNumber}: ${socket.playerName} mucked\n\n`);
       io.to(roomId).emit('cardsMucked', { playerId: socket.id, playerName: socket.playerName });
       scheduleNextHoldEmHand(roomId, HOLDEM_MUCK_DELAY);
     }
@@ -1403,6 +1407,14 @@ function runOutHoldEmBoard(roomId) {
     }
   };
   clearTimeout(game.runOutTimer);
+
+  // Betting is over: turn every remaining player's cards face up before the
+  // rest of the board is dealt
+  const hands = game.players
+    .filter(p => !game.foldedPlayers.has(p.id) && game.playerHands[p.id])
+    .map(p => ({ id: p.id, name: p.name, cards: game.playerHands[p.id] }));
+  io.to(roomId).emit('showdownReveal', { hands });
+
   game.runOutTimer = setTimeout(step, HOLDEM_STEP_DELAY);
 }
 
@@ -1412,6 +1424,7 @@ function finishHoldEmHand(roomId, result) {
   const data = holdEmPlayerData[roomId] || {};
   if (!game) return;
   clearTimeout(game.runOutTimer);
+  writeHandHistory(roomId, game);
 
   io.to(roomId).emit('handComplete', {
     winners: result.winners,
@@ -1536,6 +1549,43 @@ function startNextHoldEmHand(roomId) {
 
   broadcastHoldEmState(roomId, 'gameState');
   if (result.autoAdvanceNeeded) runOutHoldEmBoard(roomId);
+}
+
+/* ===============================
+   HOLD'EM HAND HISTORY
+   Every finished hand is appended to logs/holdem-hands-YYYY-MM-DD.log
+================================ */
+const HAND_LOG_DIR = process.env.HAND_LOG_DIR || path.join(__dirname, '..', 'logs');
+// On Render (which sets RENDER=true) print each full hand to the server output too,
+// so it can be copied from the Render dashboard's Logs tab
+const HAND_LOG_TO_CONSOLE = !!(process.env.RENDER || process.env.HAND_LOG_TO_CONSOLE);
+
+function localStamp(date = new Date()) {
+  const pad = n => String(n).padStart(2, '0');
+  return {
+    day: `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
+    time: `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  };
+}
+
+function appendHandLog(text) {
+  if (HAND_LOG_TO_CONSOLE) console.log(text.trimEnd());
+  const { day } = localStamp();
+  fs.mkdir(HAND_LOG_DIR, { recursive: true }, (dirErr) => {
+    if (dirErr) return console.error('Hand history: could not create logs folder', dirErr.message);
+    fs.appendFile(path.join(HAND_LOG_DIR, `holdem-hands-${day}.log`), text, (err) => {
+      if (err) console.error('Hand history: could not write', err.message);
+    });
+  });
+}
+
+function writeHandHistory(roomId, game) {
+  if (!game.handLog || game.handLogWritten === game.handNumber) return;
+  game.handLogWritten = game.handNumber;
+  const { day, time } = localStamp();
+  const header = `===== Hand #${game.handNumber}  ${day} ${time}  (room ${roomId}) =====`;
+  appendHandLog([header, ...game.handLog, ''].join('\n') + '\n');
+  if (!HAND_LOG_TO_CONSOLE) console.log(`📝 Hand #${game.handNumber} saved to hand history`);
 }
 
 /** Give a busted/watching player a new stack; they're dealt in from the next hand. */

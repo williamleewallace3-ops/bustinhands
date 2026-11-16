@@ -70,10 +70,8 @@ function initializeTexasHoldEmUI() {
         <button id="betAllInBtn" class="bet-size-btn" data-bet-type="allin" style="display:none;">All-In</button>
       </div>
       <div class="custom-bet-area">
-        <input type="number" id="customBetAmount" placeholder="Custom amount" min="0" step="0.01" style="display:none;">
-        <button id="customBetBtn" class="bet-size-btn" data-bet-type="custom" style="display:none;">Custom</button>
-        <button id="confirmCustomBetBtn" style="display:none;">Confirm</button>
-        <button id="cancelBetBtn" class="cancel-btn" style="display:none;">Cancel</button>
+        <input type="number" id="customBetAmount" placeholder="Amount" min="0" step="0.01" style="display:none;">
+        <button id="customBetBtn" class="bet-size-btn" style="display:none;">Bet</button>
       </div>
     </div>
   `;
@@ -531,10 +529,9 @@ function createCardElement(card) {
   const imagePath = `/cards/${rankName}_of_${suitName}.png`;
   
   // Set background image
+  // Size and margin come from the .community-card / .hole-card styles
   cardDiv.style.backgroundImage = `url('${imagePath}')`;
-  cardDiv.style.backgroundSize = 'cover';
-  cardDiv.style.backgroundPosition = 'center';
-  
+
   cardDiv.setAttribute('data-rank', rank);
   cardDiv.setAttribute('data-suit', suit);
   
@@ -659,21 +656,16 @@ function showBetSizingOptions(gameState, betType) {
     }
   }
 
-  // Show custom bet option with validation
+  // Typed amount + one Bet / Raise button
   const customBetBtn = document.getElementById('customBetBtn');
   const customBetAmount = document.getElementById('customBetAmount');
   if (customBetBtn) {
     customBetBtn.style.display = 'inline-block';
+    customBetBtn.textContent = verb === 'Bet' ? 'Bet' : 'Raise';
     customBetAmount.style.display = 'inline-block';
     customBetAmount.value = '';
-    customBetAmount.placeholder = `${verb}: $${minBet.toFixed(2)} - $${maxBet.toFixed(2)}`;
+    customBetAmount.placeholder = `$${minBet.toFixed(2)} - $${maxBet.toFixed(2)}`;
   }
-
-  // Show confirm and cancel buttons for custom
-  const confirmCustomBetBtn = document.getElementById('confirmCustomBetBtn');
-  const cancelBetBtn = document.getElementById('cancelBetBtn');
-  if (confirmCustomBetBtn) confirmCustomBetBtn.style.display = 'inline-block';
-  if (cancelBetBtn) cancelBetBtn.style.display = 'inline-block';
 
   // Show bet options container
   betOptions.style.display = 'flex';
@@ -785,9 +777,8 @@ function attachTexasHoldEmListeners() {
   const bet2xBtn = document.getElementById('bet2xBtn');
   const betAllInBtn = document.getElementById('betAllInBtn');
   const customBetBtn = document.getElementById('customBetBtn');
-  const confirmCustomBetBtn = document.getElementById('confirmCustomBetBtn');
-  const cancelBetBtn = document.getElementById('cancelBetBtn');
-  
+  const customBetAmount = document.getElementById('customBetAmount');
+
   // Action buttons
   if (checkBtn) checkBtn.addEventListener('click', () => playerAction('check'));
   if (callBtn) callBtn.addEventListener('click', (e) => {
@@ -839,12 +830,12 @@ function attachTexasHoldEmListeners() {
     playerAction(actionType, amount);
   });
   
-  if (customBetBtn) customBetBtn.addEventListener('click', () => {
-    const customInput = document.getElementById('customBetAmount');
-    customInput.focus();
+  // Enter in the amount field works like clicking Bet / Raise
+  if (customBetAmount) customBetAmount.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') customBetBtn?.click();
   });
-  
-  if (confirmCustomBetBtn) confirmCustomBetBtn.addEventListener('click', () => {
+
+  if (customBetBtn) customBetBtn.addEventListener('click', () => {
     const customInput = document.getElementById('customBetAmount');
     const amount = parseFloat(customInput.value) || 0;
     const actionType = document.getElementById('betOptions').dataset.actionType || 'bet';
@@ -877,11 +868,6 @@ function attachTexasHoldEmListeners() {
     }
 
     playerAction(actionType, amount);
-  });
-  
-  if (cancelBetBtn) cancelBetBtn.addEventListener('click', () => {
-    const betOptions = document.getElementById('betOptions');
-    betOptions.style.display = 'none';
   });
 }
 
@@ -942,7 +928,7 @@ function addTexasHoldEmStyles() {
     
     .card-list {
       display: flex;
-      gap: 10px;
+      gap: 14px;
       justify-content: center;
     }
     
@@ -956,8 +942,20 @@ function addTexasHoldEmStyles() {
       background-size: cover;
       background-position: center;
     }
+
+    /* Board and hole cards: draw the whole card image inside a white margin
+       so the corner numbers aren't cropped */
+    .community-card,
+    .hole-card {
+      background-color: #fff;
+      background-size: auto 90%;
+      background-repeat: no-repeat;
+      background-position: center;
+    }
     
     .community-card {
+      width: 66px;   /* 10% larger than a standard card */
+      height: 88px;
       transform: scale(1.1);
     }
     
@@ -1129,8 +1127,8 @@ function addTexasHoldEmStyles() {
     }
     
     .table-card {
-      width: 30px;
-      height: 40px;
+      width: 33px;
+      height: 44px;
       border: 1px solid rgba(255, 255, 255, 0.3);
       border-radius: 2px;
       background-size: cover;
@@ -1454,21 +1452,6 @@ function addTexasHoldEmStyles() {
       font-size: 13px;
     }
     
-    .cancel-btn {
-      padding: 8px 14px;
-      border: 1px solid #ccc;
-      border-radius: 4px;
-      background: #555;
-      color: white;
-      cursor: pointer;
-      transition: all 0.2s ease;
-      font-size: 13px;
-    }
-    
-    .cancel-btn:hover {
-      background: #777;
-    }
-    
     /* Player's own hole cards - displayed below betting controls */
     .player-hole-cards-area {
       display: flex;
@@ -1483,15 +1466,16 @@ function addTexasHoldEmStyles() {
     }
     
     .hole-card {
-      width: 60px;
-      height: 80px;
+      width: 66px;
+      height: 88px;
       margin: 0 2px;
     }
     
     /* Cards turned face up in a seat window (showdown / shown) */
     .table-card.face-up {
       background-color: #fff;
-      background-size: contain;
+      background-size: auto 88%;
+      background-position: center;
       border-color: #fff;
     }
 

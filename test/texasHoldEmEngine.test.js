@@ -404,6 +404,46 @@ test('banner: fold win shows no hand', () => {
   assert.equal(winner[0].amount, res.handComplete.pot);
 });
 
+/* ---------- hand history ---------- */
+test('hand history: fold win records blinds, actions and result', () => {
+  const { g } = newHand([10, 10, 10]);
+  act(g, 'fold');
+  act(g, 'fold');
+  const log = g.handLog.join('\n');
+  assert.match(log, /^Blinds \$0\.05\/\$0\.10 {2}\| {2}Dealer: /);
+  assert.match(log, /Hole cards: .*\[\w+ \w+\]/);
+  assert.match(log, /posts small blind \$0\.05/);
+  assert.match(log, /posts big blind \$0\.10/);
+  assert.equal((log.match(/: Fold/g) || []).length, 2);
+  assert.match(log, /wins \$0\.15 \(everyone else folded\)/);
+  assert.match(log, /Ending stacks: /);
+});
+
+test('hand history: all-in run-out records every street and the showdown', () => {
+  const { g } = newHand([10, 10]);
+  act(g, 'raise', 10);
+  const res = act(g, 'call');
+  assert.ok(res.autoAdvanceNeeded);
+  runOut(g);
+  const log = g.handLog.join('\n');
+  assert.match(log, /All-in \$10\.00/);
+  assert.match(log, /No more betting possible/);
+  assert.match(log, /--- Flop \[\S+ \S+ \S+\] ---/);
+  assert.match(log, /--- Turn \[(\S+ ){3}\S+\] ---/);
+  assert.match(log, /--- River \[(\S+ ){4}\S+\] ---/);
+  assert.match(log, /--- Showdown {2}Board /);
+  assert.match(log, /wins \$\d+\.\d\d with /);
+});
+
+test('hand history: each hand starts a fresh log with the next number', () => {
+  const { g } = newHand([10, 10, 10]);
+  const first = g.handNumber;
+  act(g, 'fold'); act(g, 'fold');
+  E.startNewHand(g);
+  assert.equal(g.handNumber, first + 1);
+  assert.ok(!g.handLog.some(l => /everyone else folded/.test(l)));
+});
+
 console.log = realLog;
 for (const f of failures) console.log(`FAIL  ${f.name}\n      ${f.err.message}`);
 console.log(`\n${passed} passed, ${failures.length} failed`);

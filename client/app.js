@@ -1700,6 +1700,15 @@ socket.on('offerShowCards', ({ decisionSeconds }) => {
   showShowMuckChoice(decisionSeconds);
 });
 
+// Everyone left is all-in: cards go face up before the rest of the board is dealt
+socket.on('showdownReveal', ({ hands }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  hideBettingControls();
+  (hands || []).forEach(h => {
+    if (h.id !== mySocketId) revealSeatCards(h.id, h.cards);
+  });
+});
+
 socket.on('cardsShown', ({ playerId, playerName, cards }) => {
   if (selectedGame !== 'texasHoldEm') return;
   if (playerId === mySocketId) {

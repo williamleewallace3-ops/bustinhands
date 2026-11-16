@@ -109,6 +109,8 @@ function startNewHand(game) {
   game.startingStacks = {};
   game.lastResult = null;
   game.lastActions = {};
+  game.handNumber = (game.handNumber || 0) + 1;
+  game.handLog = [];
   game.players.forEach(p => {
     p.stack = roundMoney(p.stack);
     p.currentBet = 0;
@@ -133,8 +135,17 @@ function startNewHand(game) {
     game.playerHands[p.id] = [game.deck.pop(), game.deck.pop()];
   }
 
-  postBlind(game, game.players[game.smallBlindPos], game.smallBlind);
-  postBlind(game, game.players[game.bigBlindPos], game.bigBlind);
+  const sbPlayer = game.players[game.smallBlindPos];
+  const bbPlayer = game.players[game.bigBlindPos];
+  postBlind(game, sbPlayer, game.smallBlind);
+  postBlind(game, bbPlayer, game.bigBlind);
+
+  logHand(game, `Blinds ${money(game.smallBlind)}/${money(game.bigBlind)}  |  Dealer: ${game.players[game.dealerButton].name}`);
+  logHand(game, `Seats: ${game.players.map(p => `${p.name} ${money(game.startingStacks[p.id])}`).join(', ')}`);
+  logHand(game, `Hole cards: ${game.players.map(p => `${p.name} ${cardList(game.playerHands[p.id])}`).join(', ')}`);
+  logHand(game, '--- Preflop ---');
+  logHand(game, `${sbPlayer.name} posts small blind ${money(sbPlayer.currentBet)}${toCents(sbPlayer.stack) === 0 ? ' (all-in)' : ''}`);
+  logHand(game, `${bbPlayer.name} posts big blind ${money(bbPlayer.currentBet)}${toCents(bbPlayer.stack) === 0 ? ' (all-in)' : ''}`);
   // Callers owe the full big blind even if the big blind was short
   game.highestBet = game.bigBlind;
 
@@ -236,6 +247,7 @@ function handlePlayerAction(game, playerId, action, amount = 0) {
 
   game.playersActedThisRound.add(playerId);
   game.lastActions[playerId] = describeAction(game, player, action, betBefore, highestBefore);
+  logHand(game, `${player.name}: ${game.lastActions[playerId]}`);
   return advanceBetting(game);
 }
 
@@ -330,6 +342,7 @@ function endBettingRound(game) {
   if (actors.length <= 1) {
     // Nobody can bet any more: deal the remaining streets automatically
     game.currentBettor = null;
+    logHand(game, '(No more betting possible: the rest of the board is dealt out)');
     return { success: true, autoAdvanceNeeded: true };
   }
 
@@ -363,6 +376,8 @@ function dealNextStreet(game) {
     game.communityCards.push(game.deck.pop());
     game.state = 'river';
   }
+  const street = { flop: 'Flop', turn: 'Turn', river: 'River' }[game.state];
+  if (street) logHand(game, `--- ${street} ${cardList(game.communityCards)} ---`);
 }
 
 /**
@@ -393,6 +408,7 @@ function removePlayer(game, playerId) {
 
   if (isFolded(game, player)) return { success: true };
   game.lastActions[playerId] = 'Fold';
+  logHand(game, `${player.name}: Fold (left the table)`);
   game.foldedPlayers.add(playerId);
   game.activePlayers = game.activePlayers.filter(id => id !== playerId);
 
@@ -566,9 +582,42 @@ function determineWinner(game) {
     };
   }
 
+  logResult(game, result);
   game.handInProgress = false;
   game.lastResult = result;
   return result;
+}
+
+/* ===============================
+   HAND HISTORY (game.handLog: one line per event, written out by the server)
+================================ */
+const money = (x) => `$${Number(x || 0).toFixed(2)}`;
+const cardList = (cards) => `[${(cards || []).map(c => `${c.rank}${c.suit}`).join(' ')}]`;
+
+function logHand(game, line) {
+  if (!game.handLog) game.handLog = [];
+  game.handLog.push(line);
+}
+
+function logResult(game, result) {
+  if (result.method === 'fold') {
+    logHand(game, '--- Result ---');
+    logHand(game, `${result.winnerNames[0]} wins ${money(result.pot)} (everyone else folded)`);
+  } else {
+    logHand(game, `--- Showdown  Board ${cardList(game.communityCards)} ---`);
+    result.shownHands.forEach(h => logHand(game, `${h.name} ${cardList(h.cards)}: ${h.description}`));
+    logHand(game, '--- Result ---');
+    const contested = result.sidePotDistribution.filter(sp => !sp.uncalled);
+    contested.forEach((sp, i) => {
+      const label = contested.length === 1 ? 'Pot' : (i === 0 ? 'Main pot' : `Side pot ${i}`);
+      logHand(game, `${label} ${money(sp.potAmount)}: ${sp.winners.join(' and ')}${sp.winners.length > 1 ? ' split' : ''}`);
+    });
+    result.sidePotDistribution.filter(sp => sp.uncalled).forEach(sp => {
+      logHand(game, `Uncalled ${money(sp.potAmount)} returned to ${sp.winners.join(', ')}`);
+    });
+    result.winnerSummary.forEach(w => logHand(game, `${w.name} wins ${money(w.amount)} with ${w.hand}`));
+  }
+  logHand(game, `Ending stacks: ${game.players.map(p => `${p.name} ${money(p.stack)}`).join(', ')}`);
 }
 
 /* ===============================
