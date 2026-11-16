@@ -1,8 +1,23 @@
-const { rankValue, SUIT_RANK } = require('./utils');
-
 // ========================================
 // TEXAS HOLD 'EM POKER ENGINE
 // ========================================
+//
+// Money: every amount the engine exposes (stacks, bets, pot, blinds) is in
+// dollars, but all arithmetic is done in whole cents through the helpers
+// below, so amounts never pick up floating-point errors like 4.999999999.
+//
+// Bets and raises: the `amount` sent with 'bet' or 'raise' is the TOTAL the
+// player wants their bet to be this street ("raise to"), not the increment.
+//
+// handlePlayerAction / startNewHand / removePlayer return one of:
+//   { error }                       - action rejected, nothing changed
+//   { success: true }               - betting continues, game.currentBettor is next
+//   { success: true, autoAdvanceNeeded: true }
+//                                   - no more betting possible; deal the remaining
+//                                     streets with autoAdvanceOneStreet(), then
+//                                     call determineWinner()
+//   { success: true, handComplete } - hand is over and has already been paid out;
+//                                     handComplete is the determineWinner() result
 
 const RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A'];
 const SUITS = ['C', 'D', 'H', 'S'];
@@ -21,739 +36,650 @@ const HAND_RANKINGS = {
   HIGH_CARD: 1
 };
 
+/* ===============================
+   MONEY HELPERS (whole cents)
+================================ */
+const toCents = (dollars) => Math.round((Number(dollars) || 0) * 100);
+const toDollars = (cents) => cents / 100;
+const add = (a, b) => toDollars(toCents(a) + toCents(b));
+const sub = (a, b) => toDollars(toCents(a) - toCents(b));
+const roundMoney = (x) => toDollars(toCents(x));
+
 /**
  * Create a new Texas Hold 'Em game
  */
 function createGame(roomId, smallBlind = 0.05, bigBlind = 0.10) {
   return {
     roomId,
-    players: [],           // Active players at table
-    waiting: [],          // Waiting room queue
-    
-    // Game state
-    state: 'waiting',     // 'waiting', 'blinds', 'preflop', 'flop', 'turn', 'river', 'showdown', 'gameOver'
-    smallBlind,
-    bigBlind,
+    players: [],          // Players dealt into the current hand, in seat order
+    state: 'waiting',     // 'waiting', 'preflop', 'flop', 'turn', 'river', 'showdown'
+    handInProgress: false,
+    smallBlind: roundMoney(smallBlind),
+    bigBlind: roundMoney(bigBlind),
+    pendingBlinds: null,  // { smallBlind, bigBlind } applied at the start of the next hand
     pot: 0,
-    sidePots: [],         // Array of { amount, eligiblePlayers: Set(socketIds) }
-    
-    // Board cards
-    communityCards: [],   // 5 cards total by river
-    
-    // Turn/betting
-    currentBettor: null,  // socket ID of player whose turn it is
-    bettingRound: 0,      // Number of complete betting rounds
-    minBet: 0,            // Minimum bet amount
-    highestBet: bigBlind, // Highest bet in current round
-    
-    // Dealer/Blind positions
-    dealerButton: 0,      // Index in players array
+    sidePots: [],         // [{ amount, eligiblePlayers: Set(ids) }], built at showdown
+    communityCards: [],
+    currentBettor: null,  // id of the player whose turn it is (null during run-outs)
+    highestBet: 0,        // Highest total bet this street
+    lastRaiseSize: bigBlind, // Size of the last full raise this street (minimum raise increment)
+    dealerButton: -1,
     smallBlindPos: 0,
     bigBlindPos: 0,
-    
-    // Active players (haven't folded)
-    activePlayers: [],    // socket IDs
-    
-    // Betting round tracking
-    playersActedThisRound: new Set(),  // socket IDs of players who have acted in current round
-    
-    // Hand history
+    activePlayers: [],    // ids of players who have not folded
+    playersActedThisRound: new Set(),
     deck: [],
-    playerHands: {},      // socket ID -> [2 cards]
+    playerHands: {},
     foldedPlayers: new Set(),
     allInPlayers: new Set(),
-    
-    // Side pot tracking
-    playerContributions: {}, // socket ID -> total amount contributed to pot
-    allInAmounts: [],        // [{ playerId, amount }] sorted by amount
-    
-    // Blind change request
-    blindChangeRequest: null, // { requester, smallBlind, bigBlind, votes: Set }
+    playerContributions: {}, // id -> total put in the pot this hand
+    startingStacks: {},      // id -> stack at the start of the hand
+    lastResult: null,        // determineWinner() result for the finished hand
+    lastActions: {},         // id -> text of their last action ("Call $2.00", "Fold", ...)
+    blindChangeRequest: null
   };
 }
 
 /**
- * Initialize a new hand
+ * Start a new hand with game.players (caller sets the seat list; needs 2+).
+ * Moves the button, posts blinds and deals hole cards.
  */
 function startNewHand(game) {
-  // Reset hand state
-  game.state = 'blinds';
+  if (game.players.length < 2) return { error: 'Need at least 2 players' };
+
+  // Apply any blind change that was approved during the previous hand
+  if (game.pendingBlinds) {
+    game.smallBlind = game.pendingBlinds.smallBlind;
+    game.bigBlind = game.pendingBlinds.bigBlind;
+    game.pendingBlinds = null;
+  }
+
+  game.state = 'preflop';
+  game.handInProgress = true;
   game.communityCards = [];
   game.pot = 0;
   game.sidePots = [];
-  game.bettingRound = 0;
-  game.highestBet = game.bigBlind;
-  game.minBet = game.bigBlind;
+  game.highestBet = 0;
+  game.lastRaiseSize = game.bigBlind;
   game.playerHands = {};
   game.foldedPlayers = new Set();
   game.allInPlayers = new Set();
-  game.activePlayers = game.players.map(p => p.id);
   game.playersActedThisRound = new Set();
   game.playerContributions = {};
-  game.allInAmounts = [];
-  
-  // Initialize contributions tracking
+  game.startingStacks = {};
+  game.lastResult = null;
+  game.lastActions = {};
   game.players.forEach(p => {
+    p.stack = roundMoney(p.stack);
+    p.currentBet = 0;
     game.playerContributions[p.id] = 0;
+    game.startingStacks[p.id] = p.stack;
   });
-  
-  // Move dealer button
-  if (game.players.length > 0) {
-    game.dealerButton = (game.dealerButton + 1) % game.players.length;
-    game.smallBlindPos = (game.dealerButton + 1) % game.players.length;
-    game.bigBlindPos = (game.dealerButton + 2) % game.players.length;
+  game.activePlayers = game.players.map(p => p.id);
+
+  // Move the dealer button. Heads-up, the dealer posts the small blind.
+  const n = game.players.length;
+  game.dealerButton = (game.dealerButton + 1) % n;
+  if (n === 2) {
+    game.smallBlindPos = game.dealerButton;
+    game.bigBlindPos = (game.dealerButton + 1) % n;
+  } else {
+    game.smallBlindPos = (game.dealerButton + 1) % n;
+    game.bigBlindPos = (game.dealerButton + 2) % n;
   }
-  
-  // Build and shuffle deck
+
   game.deck = buildDeck();
-  
-  // Deal 2 cards to each player
-  for (let i = 0; i < game.players.length; i++) {
-    game.playerHands[game.players[i].id] = [game.deck.pop(), game.deck.pop()];
+  for (const p of game.players) {
+    game.playerHands[p.id] = [game.deck.pop(), game.deck.pop()];
   }
-  
-  // Collect blinds
-  collectBlinds(game);
+
+  postBlind(game, game.players[game.smallBlindPos], game.smallBlind);
+  postBlind(game, game.players[game.bigBlindPos], game.bigBlind);
+  // Callers owe the full big blind even if the big blind was short
+  game.highestBet = game.bigBlind;
+
+  // Preflop: first to act is left of the big blind (heads-up: the dealer/small blind)
+  const firstSeat = n === 2 ? game.smallBlindPos : (game.bigBlindPos + 1) % n;
+  game.currentBettor = null;
+  const first = findNextToAct(game, firstSeat);
+  if (first) {
+    game.currentBettor = first.id;
+    return { success: true };
+  }
+  // Nobody can act (e.g. both blinds all-in): deal it out
+  return endBettingRound(game);
 }
 
-/**
- * Collect small and big blinds
- */
-function collectBlinds(game) {
-  if (game.players.length < 2) return;
-  
-  const smallBlindPlayer = game.players[game.smallBlindPos];
-  const bigBlindPlayer = game.players[game.bigBlindPos];
-  
-  console.log(`💳 Dealer pos: ${game.dealerButton}, SB pos: ${game.smallBlindPos} (${smallBlindPlayer.name}), BB pos: ${game.bigBlindPos} (${bigBlindPlayer.name})`);
-  console.log(`📊 Players: ${game.players.map((p, i) => `${i}:${p.name}`).join(', ')}`);
-  
-  // Small blind
-  if (smallBlindPlayer.stack >= game.smallBlind) {
-    smallBlindPlayer.stack -= game.smallBlind;
-    smallBlindPlayer.currentBet = game.smallBlind;
-    game.playerContributions[smallBlindPlayer.id] += game.smallBlind;
-    game.pot += game.smallBlind;
-  } else {
-    // All-in on small blind
-    const amount = smallBlindPlayer.stack;
-    game.pot += amount;
-    game.playerContributions[smallBlindPlayer.id] += amount;
-    smallBlindPlayer.currentBet = amount;
-    smallBlindPlayer.stack = 0;
-    game.allInPlayers.add(smallBlindPlayer.id);
-    recordAllIn(game, smallBlindPlayer.id, amount);
-  }
-  
-  // Big blind
-  if (bigBlindPlayer.stack >= game.bigBlind) {
-    bigBlindPlayer.stack -= game.bigBlind;
-    bigBlindPlayer.currentBet = game.bigBlind;
-    game.playerContributions[bigBlindPlayer.id] += game.bigBlind;
-    game.pot += game.bigBlind;
-  } else {
-    // All-in on big blind
-    const amount = bigBlindPlayer.stack;
-    game.pot += amount;
-    game.playerContributions[bigBlindPlayer.id] += amount;
-    bigBlindPlayer.currentBet = amount;
-    bigBlindPlayer.stack = 0;
-    game.allInPlayers.add(bigBlindPlayer.id);
-    recordAllIn(game, bigBlindPlayer.id, amount);
-  }
-  
-  // Start betting with player after big blind
-  game.state = 'preflop';
-  game.currentBettor = game.players[(game.bigBlindPos + 1) % game.players.length].id;
-  // DON'T pre-mark blinds as acted - they need to act when it comes to them
-  console.log(`🎬 First to act: ${game.currentBettor}`);
+function postBlind(game, player, amount) {
+  const pay = Math.min(toCents(amount), toCents(player.stack));
+  putChips(game, player, toDollars(pay));
 }
 
-/**
- * Handle player action (bet, call, raise, fold, check)
- */
-function handlePlayerAction(game, playerId, action, amount = 0) {
-  const player = game.players.find(p => p.id === playerId);
-  if (!player || game.currentBettor !== playerId) {
-    return { error: 'Not your turn' };
-  }
-  
-  amount = Math.max(0, amount); // Ensure non-negative
-  
-  switch (action) {
-    case 'fold':
-      game.foldedPlayers.add(playerId);
-      game.activePlayers = game.activePlayers.filter(id => id !== playerId);
-      game.playersActedThisRound.add(playerId);
-      break;
-      
-    case 'check':
-      if (game.highestBet > (player.currentBet || 0)) {
-        return { error: 'Cannot check - there is a bet to call' };
-      }
-      game.playersActedThisRound.add(playerId);
-      break;
-      
-    case 'call':
-      const amountToCall = game.highestBet - (player.currentBet || 0);
-      if (player.stack < amountToCall) {
-        // All-in on call - use all remaining stack
-        const betAmount = player.stack;
-        player.stack = 0;
-        player.currentBet = (player.currentBet || 0) + betAmount;
-        game.playerContributions[playerId] += betAmount;
-        game.pot += betAmount;
-        game.allInPlayers.add(playerId);
-        recordAllIn(game, playerId, player.currentBet);
-      } else {
-        player.stack -= amountToCall;
-        player.currentBet = game.highestBet;
-        game.playerContributions[playerId] += amountToCall;
-        game.pot += amountToCall;
-      }
-      game.playersActedThisRound.add(playerId);
-      break;
-      
-    case 'raise':
-      if (amount <= game.highestBet - (player.currentBet || 0)) {
-        return { error: 'Raise must be greater than current bet' };
-      }
-      const actualRaise = Math.min(amount, player.stack + (player.currentBet || 0));
-      const toRemove = actualRaise - (player.currentBet || 0);
-      player.stack -= toRemove;
-      player.currentBet = actualRaise;
-      game.playerContributions[playerId] += toRemove;
-      game.pot += toRemove;
-      game.highestBet = actualRaise;
-      
-      if (player.stack === 0) {
-        game.allInPlayers.add(playerId);
-        recordAllIn(game, playerId, actualRaise);
-      }
-      game.playersActedThisRound.add(playerId);
-      break;
-      
-    case 'bet':
-      if (amount > player.stack) amount = player.stack;
-      player.stack -= amount;
-      player.currentBet = amount;
-      game.playerContributions[playerId] += amount;
-      game.pot += amount;
-      game.highestBet = player.currentBet;
-      
-      if (player.stack === 0) {
-        game.allInPlayers.add(playerId);
-        recordAllIn(game, playerId, player.currentBet);
-      }
-      game.playersActedThisRound.add(playerId);
-      break;
-      
-    default:
-      return { error: 'Unknown action' };
-  }
-  
-  // Move to next player
-  advanceBetting(game);
-  return { success: true };
+/** Move chips from a player's stack into the pot. */
+function putChips(game, player, amount) {
+  player.stack = sub(player.stack, amount);
+  player.currentBet = add(player.currentBet, amount);
+  game.playerContributions[player.id] = add(game.playerContributions[player.id] || 0, amount);
+  game.pot = add(game.pot, amount);
+  if (toCents(player.stack) === 0) game.allInPlayers.add(player.id);
 }
 
-/**
- * Record all-in amount for side pot calculation
- */
-function recordAllIn(game, playerId, totalBetAmount) {
-  // Find if player already has all-in recorded
-  const existing = game.allInAmounts.find(a => a.playerId === playerId);
-  if (existing) {
-    existing.amount = Math.max(existing.amount, totalBetAmount);
-  } else {
-    game.allInAmounts.push({ playerId, amount: totalBetAmount });
-  }
-  // Keep sorted by amount
-  game.allInAmounts.sort((a, b) => a.amount - b.amount);
+/* ===============================
+   TURN ORDER
+================================ */
+const isFolded = (game, p) => game.foldedPlayers.has(p.id);
+const canAct = (game, p) => !isFolded(game, p) && toCents(p.stack) > 0;
+
+/** Does this player still need to act before the betting round can close? */
+function needsToAct(game, p) {
+  if (!canAct(game, p)) return false;
+  if (toCents(p.currentBet) < toCents(game.highestBet)) return true;
+  if (game.playersActedThisRound.has(p.id)) return false;
+  // Matched the bet but hasn't acted: only matters if someone else can still act
+  return game.players.filter(x => canAct(game, x)).length > 1;
 }
 
-/**
- * Build side pots after a betting round completes
- * Side pots are created based on all-in levels
- */
-function buildSidePots(game) {
-  if (game.allInAmounts.length === 0) {
-    // No all-ins, simple case
-    game.sidePots = [{
-      amount: game.pot,
-      eligiblePlayers: new Set(game.players.filter(p => !game.foldedPlayers.has(p.id)).map(p => p.id))
-    }];
-    return;
+/** First player at or after seat index `startSeat` who needs to act, or null. */
+function findNextToAct(game, startSeat) {
+  const n = game.players.length;
+  for (let i = 0; i < n; i++) {
+    const p = game.players[(startSeat + i) % n];
+    if (needsToAct(game, p)) return p;
   }
-
-  game.sidePots = [];
-  let previousAmount = 0;
-  const nonFoldedPlayers = new Set(game.players.filter(p => !game.foldedPlayers.has(p.id)).map(p => p.id));
-
-  // Create a pot for each all-in level
-  for (const allIn of game.allInAmounts) {
-    const playerId = allIn.playerId;
-    const currentAmount = allIn.amount;
-
-    if (currentAmount > previousAmount) {
-      // Calculate pot size at this level
-      // Everyone who bet at least (currentAmount - previousAmount) more is eligible
-      const potIncrease = (currentAmount - previousAmount) * game.players.length;
-      
-      // Determine who is eligible for this side pot
-      const eligible = new Set();
-      for (const p of game.players) {
-        if (!game.foldedPlayers.has(p.id) && game.playerContributions[p.id] >= currentAmount) {
-          eligible.add(p.id);
-        }
-      }
-
-      if (eligible.size > 0 && potIncrease > 0) {
-        game.sidePots.push({
-          amount: potIncrease,
-          eligiblePlayers: eligible
-        });
-      }
-    }
-
-    previousAmount = currentAmount;
-  }
-
-  // Create final side pot for contributions above the highest all-in
-  if (previousAmount > 0) {
-    const maxContribution = Math.max(...Object.values(game.playerContributions));
-    if (maxContribution > previousAmount) {
-      const potIncrease = (maxContribution - previousAmount) * game.players.length;
-      const eligible = new Set();
-      for (const p of game.players) {
-        if (!game.foldedPlayers.has(p.id) && game.playerContributions[p.id] >= maxContribution) {
-          eligible.add(p.id);
-        }
-      }
-      if (eligible.size > 0 && potIncrease > 0) {
-        game.sidePots.push({
-          amount: potIncrease,
-          eligiblePlayers: eligible
-        });
-      }
-    }
-  }
-
-  // Ensure at least one pot exists with all remaining players
-  if (game.sidePots.length === 0) {
-    game.sidePots.push({
-      amount: game.pot,
-      eligiblePlayers: nonFoldedPlayers
-    });
-  }
-}
-
-/**
- * Advance to next player
- */
-function advanceBetting(game) {
-  // Find the index of the current bettor in the full players array
-  const currentPlayerIdx = game.players.findIndex(p => p.id === game.currentBettor);
-  
-  if (currentPlayerIdx === -1) {
-    // Current bettor not found, find first active player
-    const activePlayers = game.players.filter(p => !game.foldedPlayers.has(p.id));
-    game.currentBettor = activePlayers[0]?.id || null;
-    console.log(`⚠️  Current bettor not found, setting to first active: ${activePlayers[0]?.name}`);
-    return;
-  }
-  
-  // Find the next active player starting from the next position
-  let nextIdx = (currentPlayerIdx + 1) % game.players.length;
-  while (game.foldedPlayers.has(game.players[nextIdx].id) && game.players[nextIdx].id !== game.currentBettor) {
-    nextIdx = (nextIdx + 1) % game.players.length;
-  }
-  
-  game.currentBettor = game.players[nextIdx].id;
-  
-  // Check if betting round is complete
-  const activePlayers = game.players.filter(p => !game.foldedPlayers.has(p.id));
-  const activePlayerIds = new Set(activePlayers.map(p => p.id));
-  
-  // All active players must have acted
-  const allActed = activePlayers.every(p => game.playersActedThisRound.has(p.id));
-  
-  // All active players must have equal bets (or be all-in with $0 stack)
-  const allEqual = activePlayers.every(p => 
-    p.currentBet === activePlayers[0].currentBet || p.stack === 0
-  );
-  
-  // Check if only 1 player can still act (all others are all-in or folded)
-  // A player is all-in when their stack is $0
-  const canActPlayers = activePlayers.filter(p => p.stack > 0);
-  const onlyOneCanAct = canActPlayers.length === 1;
-  
-  console.log(`✅ Next to act: ${game.players[nextIdx].name}`);
-  console.log(`   allActed=${allActed}, allEqual=${allEqual}, activeCount=${activePlayers.length}, canAct=${canActPlayers.length}`);
-  console.log(`   playersActed: ${Array.from(game.playersActedThisRound).map(id => {
-    const p = game.players.find(x => x.id === id);
-    return p?.name || id;
-  }).join(', ')}`);
-  console.log(`   player stacks: ${activePlayers.map(p => `${p.name}(${p.stack})`).join(', ')}`);
-  
-  // Check if only 1 player left - hand ends immediately
-  if (activePlayers.length === 1) {
-    console.log(`🎯 Only 1 player remaining! Hand ends - winner takes the pot`);
-    game.state = 'showdown';
-    return determineWinner(game);
-  }
-  
-  // Check if we need to auto-advance (only 1 player can act or all all-in)
-  // This must be checked BEFORE advanceStreet() because advanceStreet() resets playersActedThisRound
-  if (allActed && allEqual && canActPlayers.length <= 1 && game.state !== 'river') {
-    console.log(`🎯 Auto-dealing remaining streets (everyone all-in or no one can raise)...`);
-    advanceStreet(game);
-    return { autoAdvanceNeeded: true };
-  }
-  
-  // End betting round if all active players have acted AND all have equal bets
-  if (allActed && allEqual) {
-    console.log(`🎯 Betting round complete, advancing to next street`);
-    advanceStreet(game);
-  }
-}
-
-/**
- * Advance to next street (flop, turn, river, showdown)
- */
-function advanceStreet(game) {
-  // Build side pots before resetting bets
-  buildSidePots(game);
-  
-  // Reset bets for next round
-  game.players.forEach(p => p.currentBet = 0);
-  game.highestBet = 0;
-  game.minBet = game.bigBlind;
-  game.bettingRound++;
-  game.playersActedThisRound = new Set(); // Reset acting tracking for next round
-  
-  switch (game.state) {
-    case 'preflop':
-      // Reveal flop (3 cards)
-      game.communityCards.push(game.deck.pop());
-      game.communityCards.push(game.deck.pop());
-      game.communityCards.push(game.deck.pop());
-      game.state = 'flop';
-      break;
-      
-    case 'flop':
-      // Reveal turn (1 card)
-      game.communityCards.push(game.deck.pop());
-      game.state = 'turn';
-      break;
-      
-    case 'turn':
-      // Reveal river (1 card)
-      game.communityCards.push(game.deck.pop());
-      game.state = 'river';
-      break;
-      
-    case 'river':
-      // Showdown
-      game.state = 'showdown';
-      return determineWinner(game);
-      
-    default:
-      break;
-  }
-  
-  // Set first bettor to small blind (or first active player if SB folded)
-  const activePlayers = game.players.filter(p => !game.foldedPlayers.has(p.id));
-  const smallBlindPlayer = game.players[game.smallBlindPos];
-  if (activePlayers.includes(smallBlindPlayer)) {
-    game.currentBettor = smallBlindPlayer.id;
-  } else {
-    game.currentBettor = activePlayers[0]?.id || null;
-  }
-  
   return null;
 }
 
 /**
- * Auto-advance one street (flop, turn, river) for when only 1 player can act
+ * Handle player action (fold, check, call, bet, raise)
+ */
+function handlePlayerAction(game, playerId, action, amount = 0) {
+  if (!game.handInProgress) return { error: 'No hand in progress' };
+  const player = game.players.find(p => p.id === playerId);
+  if (!player || game.currentBettor !== playerId) {
+    return { error: 'Not your turn' };
+  }
+  if (!canAct(game, player)) return { error: 'You cannot act' };
+
+  const toCall = sub(game.highestBet, player.currentBet);
+  const betBefore = player.currentBet;
+  const highestBefore = game.highestBet;
+
+  switch (action) {
+    case 'fold':
+      game.foldedPlayers.add(playerId);
+      game.activePlayers = game.activePlayers.filter(id => id !== playerId);
+      break;
+
+    case 'check':
+      if (toCents(toCall) > 0) {
+        return { error: 'Cannot check - there is a bet to call' };
+      }
+      break;
+
+    case 'call': {
+      if (toCents(toCall) <= 0) break; // nothing to call: same as a check
+      const pay = Math.min(toCents(toCall), toCents(player.stack));
+      putChips(game, player, toDollars(pay));
+      break;
+    }
+
+    case 'bet':
+    case 'raise': {
+      const result = applyRaise(game, player, amount);
+      if (result.error) return result;
+      break;
+    }
+
+    default:
+      return { error: 'Unknown action' };
+  }
+
+  game.playersActedThisRound.add(playerId);
+  game.lastActions[playerId] = describeAction(game, player, action, betBefore, highestBefore);
+  return advanceBetting(game);
+}
+
+/** Short text for a player's action, shown in their seat window. */
+function describeAction(game, player, action, betBefore, highestBefore) {
+  const money = (x) => `$${Number(x).toFixed(2)}`;
+  const allIn = toCents(player.stack) === 0;
+  if (action === 'fold') return 'Fold';
+  if (action === 'check' || (action === 'call' && toCents(player.currentBet) === toCents(betBefore))) {
+    return 'Check';
+  }
+  if (allIn) return `All-in ${money(player.currentBet)}`;
+  if (action === 'call') return `Call ${money(sub(player.currentBet, betBefore))}`;
+  return toCents(highestBefore) === 0
+    ? `Bet ${money(player.currentBet)}`
+    : `Raise to ${money(player.currentBet)}`;
+}
+
+/**
+ * Bet or raise to a total of `raiseTo` for this street.
+ */
+function applyRaise(game, player, raiseTo) {
+  const target = toCents(raiseTo);
+  const maxTotal = toCents(player.stack) + toCents(player.currentBet);
+  const highest = toCents(game.highestBet);
+  const minRaiseTo = getMinRaiseTo(game);
+  const isAllIn = target >= maxTotal;
+  const total = isAllIn ? maxTotal : target;
+
+  if (!isAllIn) {
+    if (total <= highest) {
+      return { error: `Raise must be more than the current bet of $${game.highestBet.toFixed(2)}` };
+    }
+    if (total < toCents(minRaiseTo)) {
+      return highest === 0
+        ? { error: `Minimum bet is $${minRaiseTo.toFixed(2)}` }
+        : { error: `Minimum raise is to $${minRaiseTo.toFixed(2)}` };
+    }
+  }
+
+  putChips(game, player, toDollars(total - toCents(player.currentBet)));
+
+  if (total > highest) {
+    const raiseSize = total - highest;
+    game.highestBet = toDollars(total);
+    if (raiseSize >= toCents(game.lastRaiseSize)) {
+      // A full raise re-opens the betting: everyone else must act again
+      game.lastRaiseSize = toDollars(raiseSize);
+      game.playersActedThisRound = new Set();
+    }
+    // A short all-in raise doesn't re-open betting, but anyone below the new
+    // highest bet still has to call it (needsToAct checks the bet amount).
+  }
+  return { success: true };
+}
+
+/** Smallest legal "raise to" total right now. */
+function getMinRaiseTo(game) {
+  if (toCents(game.highestBet) === 0) return game.bigBlind;
+  return add(game.highestBet, game.lastRaiseSize);
+}
+
+/**
+ * After an action: pick the next player, or close the betting round.
+ */
+function advanceBetting(game) {
+  const remaining = game.players.filter(p => !isFolded(game, p));
+  if (remaining.length === 1) {
+    return { success: true, handComplete: determineWinner(game) };
+  }
+
+  const currentSeat = game.players.findIndex(p => p.id === game.currentBettor);
+  const next = findNextToAct(game, currentSeat + 1);
+  if (next) {
+    game.currentBettor = next.id;
+    return { success: true };
+  }
+  return endBettingRound(game);
+}
+
+/**
+ * Betting round is over: deal the next street, run it out, or go to showdown.
+ */
+function endBettingRound(game) {
+  resetStreet(game);
+  const remaining = game.players.filter(p => !isFolded(game, p));
+  const actors = remaining.filter(p => canAct(game, p));
+
+  if (game.state === 'river') {
+    return { success: true, handComplete: determineWinner(game) };
+  }
+  if (actors.length <= 1) {
+    // Nobody can bet any more: deal the remaining streets automatically
+    game.currentBettor = null;
+    return { success: true, autoAdvanceNeeded: true };
+  }
+
+  dealNextStreet(game);
+  // After the flop, action starts with the first player left of the dealer
+  const first = findNextToAct(game, game.dealerButton + 1);
+  game.currentBettor = first ? first.id : null;
+  return { success: true };
+}
+
+function resetStreet(game) {
+  game.players.forEach(p => { p.currentBet = 0; });
+  // New street: clear last actions, but folds and all-ins stay for the whole hand
+  for (const id of Object.keys(game.lastActions || {})) {
+    const text = game.lastActions[id];
+    if (text !== 'Fold' && !text.startsWith('All-in')) delete game.lastActions[id];
+  }
+  game.highestBet = 0;
+  game.lastRaiseSize = game.bigBlind;
+  game.playersActedThisRound = new Set();
+}
+
+function dealNextStreet(game) {
+  if (game.state === 'preflop') {
+    game.communityCards.push(game.deck.pop(), game.deck.pop(), game.deck.pop());
+    game.state = 'flop';
+  } else if (game.state === 'flop') {
+    game.communityCards.push(game.deck.pop());
+    game.state = 'turn';
+  } else if (game.state === 'turn') {
+    game.communityCards.push(game.deck.pop());
+    game.state = 'river';
+  }
+}
+
+/**
+ * Deal one street during an all-in run-out.
+ * Returns true once all five board cards are out (time for showdown).
  */
 function autoAdvanceOneStreet(game) {
-  if (game.state === 'river') {
+  if (game.communityCards.length >= 5) {
     game.state = 'showdown';
-    return true; // True means we're done
-  }
-  
-  const oldState = game.state;
-  advanceStreet(game);
-  console.log(`🎰 Auto-advanced: ${oldState} → ${game.state}`);
-  
-  return game.state === 'showdown';
-}
-
-/**
- * Auto-advance remaining streets (flop, turn, river) with delays when only 1 player can act
- */
-
-/**
- * Determine winner(s) at showdown with side pot support
- */
-function determineWinner(game) {
-  const remainingPlayers = game.players.filter(p => !game.foldedPlayers.has(p.id));
-  
-  if (remainingPlayers.length === 1) {
-    // Everyone else folded - winner takes all pots
-    const winner = remainingPlayers[0];
-    winner.stack += game.pot;
-    return {
-      winners: [winner.id],
-      winnerNames: [winner.name],
-      pot: game.pot,
-      method: 'fold',
-      sidePotDistribution: [{
-        potAmount: game.pot,
-        winners: [winner.name]
-      }]
-    };
-  }
-
-  // Multiple players remaining - evaluate hands and distribute side pots
-  const hands = remainingPlayers.map(player => ({
-    id: player.id,
-    name: player.name,
-    hand: evaluateHand(game.playerHands[player.id], game.communityCards)
-  }));
-
-  // Build side pots if not already done
-  if (game.sidePots.length === 0) {
-    buildSidePots(game);
-  }
-
-  // Distribute each side pot to the best eligible player(s)
-  const winnings = {}; // playerId -> total winnings
-  remainingPlayers.forEach(p => {
-    winnings[p.id] = 0;
-  });
-
-  const sidePotDistribution = [];
-  let totalDistributed = 0;
-
-  for (const sidePot of game.sidePots) {
-    // Find best hand among eligible players
-    const eligibleHands = hands.filter(h => sidePot.eligiblePlayers.has(h.id));
-    
-    if (eligibleHands.length === 0) {
-      // No eligible players (shouldn't happen, but fallback)
-      continue;
-    }
-
-    if (eligibleHands.length === 1) {
-      // Only one eligible player gets this pot
-      const winner = eligibleHands[0];
-      winnings[winner.id] += sidePot.amount;
-      totalDistributed += sidePot.amount;
-      sidePotDistribution.push({
-        potAmount: sidePot.amount,
-        winners: [winner.name]
-      });
-    } else {
-      // Multiple eligible players - find best hands
-      eligibleHands.sort((a, b) => compareHands(b.hand, a.hand));
-      const bestHandRank = eligibleHands[0].hand.rank;
-      const bestTieBreaker = eligibleHands[0].hand.tieBreaker;
-      
-      const potWinners = eligibleHands.filter(h => 
-        h.hand.rank === bestHandRank && h.hand.tieBreaker === bestTieBreaker
-      );
-
-      const winningsPerPlayer = sidePot.amount / potWinners.length;
-      potWinners.forEach(winner => {
-        winnings[winner.id] += winningsPerPlayer;
-        totalDistributed += winningsPerPlayer;
-      });
-
-      sidePotDistribution.push({
-        potAmount: sidePot.amount,
-        winners: potWinners.map(w => w.name)
-      });
-    }
-  }
-
-  // Apply winnings to player stacks
-  Object.keys(winnings).forEach(playerId => {
-    const player = game.players.find(p => p.id === playerId);
-    if (player) {
-      player.stack += winnings[playerId];
-    }
-  });
-
-  // Determine overall winners (players who won at least one pot)
-  const overallWinners = hands.filter(h => winnings[h.id] > 0);
-
-  return {
-    winners: overallWinners.map(w => w.id),
-    winnerNames: overallWinners.map(w => w.name),
-    pot: game.pot,
-    method: 'showdown',
-    allHands: hands.map(h => ({ name: h.name, hand: h.hand.description })),
-    sidePotDistribution: sidePotDistribution,
-    winnings: winnings
-  };
-}
-
-/**
- * Evaluate best 5-card hand from 7 cards (2 hole + 5 community)
- */
-function evaluateHand(holeCards, communityCards) {
-  const allCards = [...holeCards, ...communityCards];
-  
-  if (allCards.length < 5) {
-    return { rank: 0, description: 'Incomplete' };
-  }
-  
-  // Generate all 5-card combinations
-  const combinations = generate5CardCombinations(allCards);
-  const evaluatedHands = combinations.map(combo => evalPokerHand(combo));
-  
-  // Return best hand
-  return evaluatedHands.reduce((best, current) =>
-    compareHands(current, best) > 0 ? current : best
-  );
-}
-
-/**
- * Generate all possible 5-card combinations from 7 cards
- */
-function generate5CardCombinations(cards) {
-  const combinations = [];
-  const n = cards.length;
-  
-  for (let i = 0; i < n - 4; i++) {
-    for (let j = i + 1; j < n - 3; j++) {
-      for (let k = j + 1; k < n - 2; k++) {
-        for (let l = k + 1; l < n - 1; l++) {
-          for (let m = l + 1; m < n; m++) {
-            combinations.push([cards[i], cards[j], cards[k], cards[l], cards[m]]);
-          }
-        }
-      }
-    }
-  }
-  
-  return combinations;
-}
-
-/**
- * Evaluate a single 5-card poker hand
- */
-function evalPokerHand(cards) {
-  const ranks = cards.map(c => getRankValue(c.rank)).sort((a, b) => b - a);
-  const suits = cards.map(c => c.suit);
-  const suitCounts = countOccurrences(suits);
-  const rankCounts = countOccurrences(ranks);
-  
-  // Check for flush
-  const isFlush = Math.max(...Object.values(suitCounts)) === 5;
-  
-  // Check for straight
-  const isStraight = checkStraight(ranks);
-  
-  // Get hand type and rank
-  const counts = Object.values(rankCounts).sort((a, b) => b - a);
-  
-  if (isFlush && isStraight) {
-    return {
-      rank: HAND_RANKINGS.STRAIGHT_FLUSH,
-      tieBreaker: ranks[0],
-      description: `Straight Flush (${describeCards(cards)})`
-    };
-  } else if (counts[0] === 4) {
-    const quad = Object.keys(rankCounts).find(r => rankCounts[r] === 4);
-    return {
-      rank: HAND_RANKINGS.FOUR_OF_A_KIND,
-      tieBreaker: parseInt(quad),
-      description: `Four of a Kind (${describeCards(cards)})`
-    };
-  } else if (counts[0] === 3 && counts[1] === 2) {
-    const trips = Object.keys(rankCounts).find(r => rankCounts[r] === 3);
-    return {
-      rank: HAND_RANKINGS.FULL_HOUSE,
-      tieBreaker: parseInt(trips),
-      description: `Full House (${describeCards(cards)})`
-    };
-  } else if (isFlush) {
-    return {
-      rank: HAND_RANKINGS.FLUSH,
-      tieBreaker: ranks[0],
-      description: `Flush (${describeCards(cards)})`
-    };
-  } else if (isStraight) {
-    return {
-      rank: HAND_RANKINGS.STRAIGHT,
-      tieBreaker: ranks[0],
-      description: `Straight (${describeCards(cards)})`
-    };
-  } else if (counts[0] === 3) {
-    const trips = Object.keys(rankCounts).find(r => rankCounts[r] === 3);
-    return {
-      rank: HAND_RANKINGS.THREE_OF_A_KIND,
-      tieBreaker: parseInt(trips),
-      description: `Three of a Kind (${describeCards(cards)})`
-    };
-  } else if (counts[0] === 2 && counts[1] === 2) {
-    return {
-      rank: HAND_RANKINGS.TWO_PAIR,
-      tieBreaker: Math.max(...Object.keys(rankCounts).filter(r => rankCounts[r] === 2)),
-      description: `Two Pair (${describeCards(cards)})`
-    };
-  } else if (counts[0] === 2) {
-    const pair = Object.keys(rankCounts).find(r => rankCounts[r] === 2);
-    return {
-      rank: HAND_RANKINGS.PAIR,
-      tieBreaker: parseInt(pair),
-      description: `Pair (${describeCards(cards)})`
-    };
-  } else {
-    return {
-      rank: HAND_RANKINGS.HIGH_CARD,
-      tieBreaker: ranks[0],
-      description: `High Card (${describeCards(cards)})`
-    };
-  }
-}
-
-/**
- * Compare two evaluated hands
- * Returns: > 0 if hand1 is better, < 0 if hand2 is better, 0 if equal
- */
-function compareHands(hand1, hand2) {
-  if (hand1.rank !== hand2.rank) {
-    return hand1.rank - hand2.rank;
-  }
-  return hand1.tieBreaker - hand2.tieBreaker;
-}
-
-/**
- * Check if ranks form a straight
- */
-function checkStraight(ranks) {
-  const unique = [...new Set(ranks)].sort((a, b) => b - a);
-  
-  if (unique.length !== 5) return false;
-  
-  // Check normal straight
-  if (unique[0] - unique[4] === 4) return true;
-  
-  // Check for A-2-3-4-5 (wheel)
-  if (unique[0] === 14 && unique[1] === 5 && unique[2] === 4 && unique[3] === 3 && unique[4] === 2) {
     return true;
   }
-  
+  dealNextStreet(game);
   return false;
 }
 
 /**
- * Get numeric value for a rank
+ * A player leaves mid-hand: they fold (their chips stay in the pot).
+ * Outside a hand they are simply removed from the seat list.
  */
+function removePlayer(game, playerId) {
+  const player = game.players.find(p => p.id === playerId);
+  if (!player) return { success: true };
+
+  if (!game.handInProgress) {
+    game.players = game.players.filter(p => p.id !== playerId);
+    return { success: true };
+  }
+
+  if (isFolded(game, player)) return { success: true };
+  game.lastActions[playerId] = 'Fold';
+  game.foldedPlayers.add(playerId);
+  game.activePlayers = game.activePlayers.filter(id => id !== playerId);
+
+  if (game.currentBettor === playerId || game.currentBettor === null) {
+    if (game.currentBettor === null) {
+      // During a run-out only check whether one player is left
+      const remaining = game.players.filter(p => !isFolded(game, p));
+      if (remaining.length === 1) return { success: true, handComplete: determineWinner(game) };
+      return { success: true };
+    }
+    return advanceBetting(game);
+  }
+
+  // Someone else's turn: the hand may now be over, or they may be the last to act
+  const remaining = game.players.filter(p => !isFolded(game, p));
+  if (remaining.length === 1) return { success: true, handComplete: determineWinner(game) };
+  const current = game.players.find(p => p.id === game.currentBettor);
+  if (current && !needsToAct(game, current)) return advanceBetting(game);
+  return { success: true };
+}
+
+/* ===============================
+   SHOWDOWN / PAYOUT
+================================ */
+
+/**
+ * Build the main pot and side pots from each player's total contribution.
+ * Folded players' chips go into the pots, but they can't win them.
+ */
+function buildSidePots(game) {
+  const contrib = {};
+  game.players.forEach(p => { contrib[p.id] = toCents(game.playerContributions[p.id] || 0); });
+  const live = game.players.filter(p => !isFolded(game, p));
+  const levels = [...new Set(live.map(p => contrib[p.id]))].filter(c => c > 0).sort((a, b) => a - b);
+
+  const pots = [];
+  let prev = 0;
+  for (const level of levels) {
+    let amount = 0;
+    for (const p of game.players) {
+      amount += Math.min(contrib[p.id], level) - Math.min(contrib[p.id], prev);
+    }
+    const eligible = new Set(live.filter(p => contrib[p.id] >= level).map(p => p.id));
+    if (amount > 0) pots.push({ amount, eligiblePlayers: eligible });
+    prev = level;
+  }
+  // Chips folded players put in above every live player's total
+  let leftover = 0;
+  for (const p of game.players) leftover += Math.max(0, contrib[p.id] - prev);
+  if (leftover > 0 && pots.length > 0) pots[pots.length - 1].amount += leftover;
+
+  // Merge neighbouring pots with the same eligible players
+  const merged = [];
+  for (const pot of pots) {
+    const last = merged[merged.length - 1];
+    const same = last && last.eligiblePlayers.size === pot.eligiblePlayers.size &&
+      [...pot.eligiblePlayers].every(id => last.eligiblePlayers.has(id));
+    if (same) last.amount += pot.amount;
+    else merged.push({ amount: pot.amount, eligiblePlayers: pot.eligiblePlayers });
+  }
+
+  game.sidePots = merged.map(p => ({ amount: toDollars(p.amount), eligiblePlayers: p.eligiblePlayers }));
+  return merged; // amounts in cents
+}
+
+/**
+ * Pay out the hand. Safe to call more than once: the hand is only paid once.
+ */
+function determineWinner(game) {
+  if (!game.handInProgress && game.lastResult) return game.lastResult;
+
+  game.state = 'showdown';
+  game.currentBettor = null;
+  resetStreet(game);
+  const remainingPlayers = game.players.filter(p => !isFolded(game, p));
+  const potCents = Object.values(game.playerContributions).reduce((a, c) => a + toCents(c), 0);
+  game.pot = toDollars(potCents);
+  let result;
+
+  if (remainingPlayers.length === 1) {
+    // Everyone else folded - winner takes the whole pot
+    const winner = remainingPlayers[0];
+    winner.stack = add(winner.stack, game.pot);
+    result = {
+      winners: [winner.id],
+      winnerNames: [winner.name],
+      pot: game.pot,
+      method: 'fold',
+      shownHands: [], // the winner may choose to show (handled by the server)
+      sidePotDistribution: [{ potAmount: game.pot, winners: [winner.name] }],
+      winnings: { [winner.id]: game.pot },
+      winnerSummary: [{ name: winner.name, amount: game.pot, hand: null }]
+    };
+  } else {
+    const hands = remainingPlayers.map(player => ({
+      id: player.id,
+      name: player.name,
+      hand: evaluateHand(game.playerHands[player.id], game.communityCards)
+    }));
+    const pots = buildSidePots(game);
+    const winningsCents = {};
+    remainingPlayers.forEach(p => { winningsCents[p.id] = 0; });
+    const sidePotDistribution = [];
+    const contestedWinners = new Set();
+    const contestedCents = {};
+
+    // Odd cents go to the winner closest to the dealer's left
+    const n = game.players.length;
+    const seatOrder = id => (game.players.findIndex(p => p.id === id) - game.dealerButton - 1 + n) % n;
+
+    for (const pot of pots) {
+      const eligible = hands.filter(h => pot.eligiblePlayers.has(h.id));
+      if (eligible.length === 0) continue;
+      eligible.sort((a, b) => compareHands(b.hand, a.hand));
+      const potWinners = eligible
+        .filter(h => compareHands(h.hand, eligible[0].hand) === 0)
+        .sort((a, b) => seatOrder(a.id) - seatOrder(b.id));
+      const share = Math.floor(pot.amount / potWinners.length);
+      let oddCents = pot.amount - share * potWinners.length;
+      potWinners.forEach(w => {
+        winningsCents[w.id] += share + (oddCents > 0 ? 1 : 0);
+        if (oddCents > 0) oddCents--;
+      });
+      sidePotDistribution.push({
+        potAmount: toDollars(pot.amount),
+        winners: potWinners.map(w => w.name),
+        // Only one player could win it: it's their own uncalled bet coming back
+        uncalled: eligible.length === 1
+      });
+      if (eligible.length > 1) {
+        const odd = pot.amount - share * potWinners.length;
+        potWinners.forEach((w, i) => {
+          contestedWinners.add(w.id);
+          // Same split as above: the first winners in seat order take the odd cents
+          contestedCents[w.id] = (contestedCents[w.id] || 0) + share + (i < odd ? 1 : 0);
+        });
+      }
+    }
+
+    const winnings = {};
+    for (const id of Object.keys(winningsCents)) {
+      winnings[id] = toDollars(winningsCents[id]);
+      const player = game.players.find(p => p.id === id);
+      if (player) player.stack = add(player.stack, winnings[id]);
+    }
+
+    // A player who only got their own uncalled chips back didn't win the hand
+    const overallWinners = hands.filter(h => contestedWinners.has(h.id));
+    result = {
+      winners: overallWinners.map(w => w.id),
+      winnerNames: overallWinners.map(w => w.name),
+      pot: game.pot,
+      method: 'showdown',
+      allHands: hands.map(h => ({ name: h.name, hand: h.hand.description })),
+      // Hole cards of everyone in the showdown, revealed to the table
+      shownHands: hands.map(h => ({
+        id: h.id,
+        name: h.name,
+        cards: game.playerHands[h.id],
+        description: h.hand.description
+      })),
+      sidePotDistribution,
+      winnings,
+      // One line per winner: who, what they won from contested pots (not their
+      // own uncalled bet coming back) and their hand in plain words
+      winnerSummary: overallWinners.map(w => ({
+        name: w.name,
+        amount: toDollars(contestedCents[w.id]),
+        hand: w.hand.plainName
+      }))
+    };
+  }
+
+  game.handInProgress = false;
+  game.lastResult = result;
+  return result;
+}
+
+/* ===============================
+   HAND EVALUATION
+================================ */
+const WORD_NAMES = { 2: 'Two', 3: 'Three', 4: 'Four', 5: 'Five', 6: 'Six', 7: 'Seven', 8: 'Eight', 9: 'Nine', 10: 'Ten', 11: 'Jack', 12: 'Queen', 13: 'King', 14: 'Ace' };
+const PLURAL_NAMES = { 2: 'Twos', 3: 'Threes', 4: 'Fours', 5: 'Fives', 6: 'Sixes', 7: 'Sevens', 8: 'Eights', 9: 'Nines', 10: 'Tens', 11: 'Jacks', 12: 'Queens', 13: 'Kings', 14: 'Aces' };
+const RANK_NAMES = { 2: '2', 3: '3', 4: '4', 5: '5', 6: '6', 7: '7', 8: '8', 9: '9', 10: '10', 11: 'J', 12: 'Q', 13: 'K', 14: 'A' };
+
+/**
+ * Evaluate best 5-card hand from up to 7 cards (2 hole + 5 community).
+ * Returns { rank, tieBreaker: [numbers], description }.
+ */
+function evaluateHand(holeCards, communityCards) {
+  const allCards = [...(holeCards || []), ...(communityCards || [])];
+  if (allCards.length < 5) {
+    return { rank: 0, tieBreaker: [], description: 'Incomplete' };
+  }
+  const combinations = generate5CardCombinations(allCards);
+  return combinations
+    .map(combo => evalPokerHand(combo))
+    .reduce((best, current) => (compareHands(current, best) > 0 ? current : best));
+}
+
+function generate5CardCombinations(cards) {
+  const combinations = [];
+  const n = cards.length;
+  for (let i = 0; i < n - 4; i++)
+    for (let j = i + 1; j < n - 3; j++)
+      for (let k = j + 1; k < n - 2; k++)
+        for (let l = k + 1; l < n - 1; l++)
+          for (let m = l + 1; m < n; m++)
+            combinations.push([cards[i], cards[j], cards[k], cards[l], cards[m]]);
+  return combinations;
+}
+
+/**
+ * Evaluate a single 5-card hand. tieBreaker lists the card ranks that decide
+ * ties, most important first (pairs/trips before kickers).
+ */
+function evalPokerHand(cards) {
+  const values = cards.map(c => getRankValue(c.rank)).sort((a, b) => b - a);
+  const isFlush = cards.every(c => c.suit === cards[0].suit);
+  const straightHigh = getStraightHigh(values);
+
+  // Group ranks by count, biggest group first, then by rank
+  const counts = {};
+  values.forEach(v => { counts[v] = (counts[v] || 0) + 1; });
+  const groups = Object.keys(counts).map(Number)
+    .sort((a, b) => counts[b] - counts[a] || b - a);
+  const shape = groups.map(g => counts[g]);
+  const desc = describeCards(cards);
+  const W = v => WORD_NAMES[v];
+  const P = v => PLURAL_NAMES[v];
+
+  if (isFlush && straightHigh) {
+    const royal = straightHigh === 14;
+    return {
+      rank: royal ? HAND_RANKINGS.ROYAL_FLUSH : HAND_RANKINGS.STRAIGHT_FLUSH,
+      tieBreaker: [straightHigh],
+      description: `${royal ? 'Royal Flush' : 'Straight Flush'} (${desc})`,
+      plainName: royal ? 'Royal flush' : `${W(straightHigh)} high straight flush`
+    };
+  }
+  if (shape[0] === 4) {
+    return { rank: HAND_RANKINGS.FOUR_OF_A_KIND, tieBreaker: groups, description: `Four of a Kind (${desc})`, plainName: `Four ${P(groups[0])}` };
+  }
+  if (shape[0] === 3 && shape[1] === 2) {
+    return { rank: HAND_RANKINGS.FULL_HOUSE, tieBreaker: groups, description: `Full House (${desc})`, plainName: `${P(groups[0])} full of ${P(groups[1])}` };
+  }
+  if (isFlush) {
+    return { rank: HAND_RANKINGS.FLUSH, tieBreaker: values, description: `Flush (${desc})`, plainName: `${W(values[0])} high flush` };
+  }
+  if (straightHigh) {
+    return { rank: HAND_RANKINGS.STRAIGHT, tieBreaker: [straightHigh], description: `Straight (${desc})`, plainName: `${W(straightHigh)} high straight` };
+  }
+  if (shape[0] === 3) {
+    return { rank: HAND_RANKINGS.THREE_OF_A_KIND, tieBreaker: groups, description: `Three of a Kind (${desc})`, plainName: `Three ${P(groups[0])}` };
+  }
+  if (shape[0] === 2 && shape[1] === 2) {
+    return { rank: HAND_RANKINGS.TWO_PAIR, tieBreaker: groups, description: `Two Pair (${desc})`, plainName: `Two pair, ${P(groups[0])} and ${P(groups[1])}` };
+  }
+  if (shape[0] === 2) {
+    return { rank: HAND_RANKINGS.PAIR, tieBreaker: groups, description: `Pair of ${RANK_NAMES[groups[0]]}s (${desc})`, plainName: `Pair of ${P(groups[0])}` };
+  }
+  return { rank: HAND_RANKINGS.HIGH_CARD, tieBreaker: values, description: `High Card (${desc})`, plainName: `${W(values[0])} high` };
+}
+
+/**
+ * Compare two evaluated hands.
+ * Returns > 0 if hand1 is better, < 0 if hand2 is better, 0 if equal.
+ */
+function compareHands(hand1, hand2) {
+  if (hand1.rank !== hand2.rank) return hand1.rank - hand2.rank;
+  const a = hand1.tieBreaker || [];
+  const b = hand2.tieBreaker || [];
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) - (b[i] || 0);
+  }
+  return 0;
+}
+
+/** High card of a straight (5 for A-2-3-4-5), or 0 if not a straight. */
+function getStraightHigh(valuesDesc) {
+  const unique = [...new Set(valuesDesc)];
+  if (unique.length !== 5) return 0;
+  if (unique[0] - unique[4] === 4) return unique[0];
+  if (unique[0] === 14 && unique[1] === 5 && unique[4] === 2) return 5; // wheel
+  return 0;
+}
+
 function getRankValue(rank) {
   const rankMap = {
     '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
@@ -762,26 +688,10 @@ function getRankValue(rank) {
   return rankMap[rank] || 0;
 }
 
-/**
- * Count occurrences of elements in array
- */
-function countOccurrences(arr) {
-  return arr.reduce((acc, val) => {
-    acc[val] = (acc[val] || 0) + 1;
-    return acc;
-  }, {});
-}
-
-/**
- * Describe cards for output
- */
 function describeCards(cards) {
   return cards.map(c => `${c.rank}${c.suit}`).join(' ');
 }
 
-/**
- * Build a standard 52-card deck
- */
 function buildDeck() {
   const deck = [];
   for (const suit of SUITS) {
@@ -789,13 +699,10 @@ function buildDeck() {
       deck.push({ rank, suit });
     }
   }
-  shuffle(deck);
-  return deck;
+  return shuffle(deck);
 }
 
-/**
- * Fisher-Yates shuffle
- */
+/** Fisher-Yates shuffle */
 function shuffle(array) {
   for (let i = array.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -804,50 +711,55 @@ function shuffle(array) {
   return array;
 }
 
-/**
- * Request blind change (requires consensus)
- */
+/* ===============================
+   BLIND CHANGES (vote, applied next hand)
+================================ */
 function requestBlindChange(game, requesterId, newSmallBlind, newBigBlind) {
-  if (newSmallBlind <= 0 || newBigBlind <= 0 || newBigBlind <= newSmallBlind) {
+  const sb = roundMoney(newSmallBlind);
+  const bb = roundMoney(newBigBlind);
+  if (sb <= 0 || bb <= 0 || bb <= sb) {
     return { error: 'Invalid blind values' };
   }
-  
   game.blindChangeRequest = {
     requester: requesterId,
-    smallBlind: newSmallBlind,
-    bigBlind: newBigBlind,
+    smallBlind: sb,
+    bigBlind: bb,
     votes: new Set([requesterId])
   };
-  
-  return { pending: true };
+  return { pending: true, votesReceived: 1, votesNeeded: requiredBlindVotes(game) };
 }
 
-/**
- * Vote on blind change
- */
+function requiredBlindVotes(game) {
+  return Math.ceil(game.players.length * 2 / 3);
+}
+
 function voteOnBlindChange(game, voterId, approve) {
   if (!game.blindChangeRequest) {
     return { error: 'No blind change pending' };
   }
-  
-  if (approve) {
-    game.blindChangeRequest.votes.add(voterId);
-  } else {
-    return { error: 'Blind change rejected' };
-  }
-  
-  // Check if consensus reached (2/3 of players)
-  const requiredVotes = Math.ceil(game.players.length * 2 / 3);
-  if (game.blindChangeRequest.votes.size >= requiredVotes) {
-    game.smallBlind = game.blindChangeRequest.smallBlind;
-    game.bigBlind = game.blindChangeRequest.bigBlind;
-    game.minBet = game.bigBlind;
-    const oldRequest = game.blindChangeRequest;
+  if (!approve) {
     game.blindChangeRequest = null;
-    return { approved: true, newBlinds: { smallBlind: game.smallBlind, bigBlind: game.bigBlind } };
+    return { rejected: true };
   }
-  
-  return { pending: true, votesNeeded: requiredVotes - game.blindChangeRequest.votes.size };
+
+  game.blindChangeRequest.votes.add(voterId);
+  const votesNeeded = requiredBlindVotes(game);
+  const votesReceived = game.blindChangeRequest.votes.size;
+  if (votesReceived >= votesNeeded) {
+    const newBlinds = {
+      smallBlind: game.blindChangeRequest.smallBlind,
+      bigBlind: game.blindChangeRequest.bigBlind
+    };
+    game.blindChangeRequest = null;
+    if (game.handInProgress) {
+      game.pendingBlinds = newBlinds; // takes effect when the next hand starts
+    } else {
+      game.smallBlind = newBlinds.smallBlind;
+      game.bigBlind = newBlinds.bigBlind;
+    }
+    return { approved: true, newBlinds };
+  }
+  return { pending: true, votesReceived, votesNeeded };
 }
 
 module.exports = {
@@ -856,6 +768,9 @@ module.exports = {
   handlePlayerAction,
   determineWinner,
   evaluateHand,
+  compareHands,
+  removePlayer,
+  getMinRaiseTo,
   requestBlindChange,
   voteOnBlindChange,
   autoAdvanceOneStreet,

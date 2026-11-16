@@ -6,6 +6,7 @@ const socket = io();
 let mySocketId = null;
 let lastTurnPlayerId = null;
 let playerStatus = 'loading'; // 'active' or 'waiting'
+let myOwnStats = null; // Store own stats
 let currentGameState = null; // Store current game state for betting validation
 let foldedPlayersThisHand = new Set(); // Track which players have folded in current hand
 
@@ -21,7 +22,7 @@ socket.on('connect', () => {
 });
 
 /* ===============================
-   BASIC SOCKET FEEDBACK (ONE TIME ONLY)
+   BASIC SOCKET FEEDBACK
 ================================ */
 socket.on('errorMessage', (msg) => {
   alert(msg);
@@ -39,6 +40,11 @@ socket.on('playerStatus', ({ status, queuePosition, stats }) => {
   }
 
   updateInGameHeaderVisibility();
+  
+  // Store stats
+  if (stats) {
+    myOwnStats = stats;
+  }
 });
 
 socket.on('playAccepted', ({ playedCards }) => {
@@ -79,12 +85,17 @@ socket.on('clearReveals', () => {
 
 let powerTakenTimeout = null;
 
-socket.on('powerTaken', ({ playerId, playerName, card }) => {
+socket.on('powerTaken', ({ playerId, playerName, cards, card }) => {
+  console.log('🎯 Power taken received:', { playerId, playerName, cards, card });
   hasPowerLead = Boolean(mySocketId && playerId === mySocketId);
-  showPowerTakenBanner(playerName, card || { rank: '2', suit: 'D' });
+  // Support both 'cards' (full hand) and 'card' (single card for backwards compatibility)
+  const cardsToShow = cards || [card] || [{ rank: '2', suit: 'D' }];
+  console.log('Cards to display:', cardsToShow, 'Array?', Array.isArray(cardsToShow));
+  showPowerTakenBanner(playerName, cardsToShow);
 });
 
-function showPowerTakenBanner(playerName, card) {
+function showPowerTakenBanner(playerName, cards) {
+  console.log('Creating power taken banner for:', playerName, 'with cards:', cards);
   const existing = document.getElementById('powerTakenBanner');
   if (existing) existing.remove();
   if (powerTakenTimeout) {
@@ -100,13 +111,25 @@ function showPowerTakenBanner(playerName, card) {
   message.className = 'power-taken-message';
   message.textContent = `${playerName || 'A player'} has taken power`;
 
-  const cardImage = document.createElement('img');
-  cardImage.className = 'power-taken-card';
-  cardImage.src = `/cards/${cardFileName(card)}`;
-  cardImage.alt = '2 of diamonds';
+  // Create container for cards
+  const cardsContainer = document.createElement('div');
+  cardsContainer.className = 'power-taken-cards-container';
+  
+  // Handle both single card and array of cards
+  const cardsArray = Array.isArray(cards) ? cards : [cards];
+  console.log('cardsArray:', cardsArray, 'length:', cardsArray.length);
+  
+  cardsArray.forEach((card, idx) => {
+    console.log(`Adding card ${idx}:`, card);
+    const cardImage = document.createElement('img');
+    cardImage.className = 'power-taken-card';
+    cardImage.src = `/cards/${cardFileName(card)}`;
+    cardImage.alt = `${card.rank} of ${card.suit}`;
+    cardsContainer.appendChild(cardImage);
+  });
 
   banner.appendChild(message);
-  banner.appendChild(cardImage);
+  banner.appendChild(cardsContainer);
   document.body.appendChild(banner);
 
   requestAnimationFrame(() => banner.classList.add('visible'));
@@ -302,8 +325,7 @@ function displayRevealedHand(socketId, playerName, cards) {
 /* ===============================
    RESET GAME
 ================================ */
-  // Reset game state
-  function resetGame() {
+function resetGame() {
   // Clear revealed hands
   const revealsContainer = document.getElementById('revealsContainer');
   if (revealsContainer) revealsContainer.remove();
@@ -333,7 +355,6 @@ function displayRevealedHand(socketId, playerName, cards) {
   }
   
   // Reset buttons
-  // Don't show ready button here - let playerStatus event control visibility
   bustBtn.style.display = 'none';
   passBtn.style.display = 'none';
   
@@ -411,6 +432,18 @@ let isMyTurn = false;
 let currentTrickCardCount = null;
 let hasPowerLead = false;
 
+/* ===============================
+   CHAT & PLAYER LIST STATE
+================================ */
+let chatMessagesList = []; // array of { playerName, message, timestamp }
+let playerListData = []; // array of player objects with stats
+let waitingPlayers = []; // array of waiting players { socketId, name }
+let activePlayers = []; // socketIds of active players
+let currentPlayerId = null; // socketId of player whose turn it is
+
+// Make playerListData globally accessible for enhancements
+window.playerListData = playerListData;
+
 const SCENE_BACKGROUNDS = {
   'vampire-bar': '/images/table_background.png',
   'high-roller': '/images/table_background1.png',
@@ -458,7 +491,6 @@ function initializeInGameOptions() {
     }
   }
 }
-
 
 /* ===============================
    CARD FILENAME HELPER
@@ -586,10 +618,284 @@ function startGame(scene) {
     updateInGameHeaderVisibility();
     
     // Initialize game-specific UI
+    // (the texas-holdem class hides the Chinese Poker chat and player panels)
+    document.body.classList.toggle('texas-holdem', selectedGame === 'texasHoldEm');
     if (selectedGame === 'texasHoldEm') {
       initializeTexasHoldEmUI();
     }
 }
+
+/* ===============================
+   CHAT & PLAYER LIST UI
+================================ */
+const chatInputEl = document.getElementById('chatInput');
+const chatMessagesEl = document.getElementById('chatMessages');
+const chatSendBtnEl = document.getElementById('chatSendBtn');
+const playerListContentEl = document.getElementById('playerListContent');
+
+// Chat input handler
+if (chatSendBtnEl) {
+  chatSendBtnEl.addEventListener('click', sendChatMessage);
+  if (chatInputEl) {
+    chatInputEl.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') sendChatMessage();
+    });
+  }
+}
+
+function sendChatMessage() {
+  if (!chatInputEl || !chatInputEl.value.trim()) return;
+  
+  const message = chatInputEl.value.trim();
+  socket.emit('chatMessage', { playerName, message, roomId });
+  chatInputEl.value = '';
+  chatInputEl.focus();
+}
+
+function displayChatMessage(playerName, message) {
+  if (!chatMessagesEl) return;
+  
+  const msgEl = document.createElement('div');
+  msgEl.className = 'chat-message';
+  
+  const nameEl = document.createElement('div');
+  nameEl.className = 'chat-message-name';
+  nameEl.textContent = playerName;
+  
+  const textEl = document.createElement('div');
+  textEl.className = 'chat-message-text';
+  textEl.textContent = message;
+  
+  msgEl.appendChild(nameEl);
+  msgEl.appendChild(textEl);
+  chatMessagesEl.appendChild(msgEl);
+  
+  // Auto-scroll to bottom
+  chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+}
+
+function updatePlayerList(players, currentTurn) {
+  if (!playerListContentEl) return;
+  
+  playerListContentEl.innerHTML = '';
+  
+  if (!Array.isArray(players)) return;
+  
+  players.forEach((player, index) => {
+    const playerEl = document.createElement('div');
+    playerEl.className = 'player-item';
+    
+    if (player.socketId === currentTurn) {
+      playerEl.classList.add('active-turn');
+    }
+    
+    const nameEl = document.createElement('div');
+    nameEl.className = 'player-name';
+    nameEl.innerHTML = `${player.name} <span class="play-order-badge">${['1st', '2nd', '3rd', '4th'][index]}</span>`;
+    
+    // Apply custom player color if available
+    if (window.getPlayerColor) {
+      const color = window.getPlayerColor(player.name);
+      nameEl.style.color = color;
+      const badgeEl = nameEl.querySelector('.play-order-badge');
+      if (badgeEl) {
+        badgeEl.style.background = color;
+      }
+    }
+    
+    const statsEl = document.createElement('div');
+    statsEl.className = 'player-stats';
+    
+    const winPercent = player.gamesPlayed > 0 
+      ? Math.round((player.wins / player.gamesPlayed) * 100) 
+      : 0;
+    
+    statsEl.innerHTML = `
+      <div class="player-stat-item"><span class="player-stat-label">Cards:</span><span class="player-stat-value">${player.cardsRemaining || 0}</span></div>
+      <div class="player-stat-item"><span class="player-stat-label">Wins:</span><span class="player-stat-value">${player.wins || 0}</span></div>
+      <div class="player-stat-item"><span class="player-stat-label">Games:</span><span class="player-stat-value">${player.gamesPlayed || 0}</span></div>
+      <div class="player-stat-item"><span class="player-stat-label">Win%:</span><span class="player-stat-value">${winPercent}%</span></div>
+    `;
+    
+    playerEl.appendChild(nameEl);
+    playerEl.appendChild(statsEl);
+    playerListContentEl.appendChild(playerEl);
+  });
+}
+
+/* ===============================
+   SOCKET HANDLERS: CHAT & PLAYER LIST
+================================ */
+
+/**
+ * Receive chat message from server
+ * Broadcast to all players in the room
+ */
+socket.on('chatMessage', ({ playerName, message }) => {
+  console.log(`Chat: ${playerName}: ${message}`);
+  displayChatMessage(playerName, message);
+  
+  // Store in chat history
+  chatMessagesList.push({ playerName, message, timestamp: new Date() });
+});
+
+// Listen for mention alerts and play a chime
+socket.on('mentionAlert', ({ mentioner, message }) => {
+  playMentionChime();
+  console.log(`You were mentioned by ${mentioner}`);
+});
+
+/**
+ * Receive player list update from server
+ * Shows all active players, their order, stats, etc.
+ */
+socket.on('playerListUpdate', ({ players, currentTurn }) => {
+  console.log('Player list updated:', players);
+  playerListData = players;
+  window.playerListData = players; // Keep globally accessible
+  currentPlayerId = currentTurn;
+  updatePlayerList(players, currentTurn);
+  
+  // Update mention suggestions with current player list
+  if (window.updatePlayerListForMentions) {
+    window.updatePlayerListForMentions(players);
+  }
+  
+  // Assign colors to players
+  if (window.assignPlayerColors) {
+    window.assignPlayerColors(players);
+  }
+});
+
+// Listen for active players list updates (as players join the game)
+socket.on('activePlayersListUpdate', (players) => {
+  if (!playerListContentEl) return;
+  
+  playerListContentEl.innerHTML = '';
+  
+  if (!Array.isArray(players)) return;
+  
+  players.forEach((player, index) => {
+    const playerEl = document.createElement('div');
+    playerEl.className = 'player-item';
+    
+    const nameEl = document.createElement('div');
+    nameEl.className = 'player-name';
+    nameEl.textContent = player.name;
+    
+    // Apply custom player color if available
+    if (window.getPlayerColor) {
+      const color = window.getPlayerColor(player.name);
+      nameEl.style.color = color;
+    }
+    
+    const statsEl = document.createElement('div');
+    statsEl.className = 'player-stats';
+    
+    const winPercent = player.gamesPlayed > 0 
+      ? Math.round((player.wins / player.gamesPlayed) * 100) 
+      : 0;
+    
+    statsEl.innerHTML = `
+      <div class="player-stat-item"><span class="player-stat-label">Wins:</span><span class="player-stat-value">${player.wins || 0}</span></div>
+      <div class="player-stat-item"><span class="player-stat-label">Games:</span><span class="player-stat-value">${player.gamesPlayed || 0}</span></div>
+      <div class="player-stat-item"><span class="player-stat-label">Win%:</span><span class="player-stat-value">${winPercent}%</span></div>
+    `;
+    
+    playerEl.appendChild(nameEl);
+    playerEl.appendChild(statsEl);
+    playerListContentEl.appendChild(playerEl);
+  });
+});
+
+// Listen for waiting players list updates
+socket.on('waitingList', (players) => {
+  waitingPlayers = players || [];
+  
+  // If there's a waiting section already, update it; otherwise append it
+  const existingWaitingSection = playerListContentEl.querySelector('.waiting-section');
+  
+  if (waitingPlayers.length === 0) {
+    // Remove waiting section if no players waiting
+    if (existingWaitingSection) {
+      existingWaitingSection.remove();
+    }
+    return;
+  }
+  
+  if (existingWaitingSection) {
+    // Update existing waiting section
+    const waitingList = existingWaitingSection.querySelector('.waiting-list');
+    waitingList.innerHTML = '';
+    
+    waitingPlayers.forEach(player => {
+      const playerEl = document.createElement('div');
+      playerEl.className = 'waiting-player-item';
+      playerEl.textContent = player.name;
+      
+      // Apply custom player color if available
+      if (window.getPlayerColor) {
+        const color = window.getPlayerColor(player.name);
+        playerEl.style.color = color;
+      }
+      
+      waitingList.appendChild(playerEl);
+    });
+  } else {
+    // Create new waiting section
+    const waitingSection = document.createElement('div');
+    waitingSection.className = 'waiting-section';
+    
+    const waitingHeader = document.createElement('div');
+    waitingHeader.className = 'waiting-header';
+    waitingHeader.textContent = 'Waiting';
+    
+    const waitingList = document.createElement('div');
+    waitingList.className = 'waiting-list';
+    
+    waitingPlayers.forEach(player => {
+      const playerEl = document.createElement('div');
+      playerEl.className = 'waiting-player-item';
+      playerEl.textContent = player.name;
+      
+      // Apply custom player color if available
+      if (window.getPlayerColor) {
+        const color = window.getPlayerColor(player.name);
+        playerEl.style.color = color;
+      }
+      
+      waitingList.appendChild(playerEl);
+    });
+    
+    waitingSection.appendChild(waitingHeader);
+    waitingSection.appendChild(waitingList);
+    playerListContentEl.appendChild(waitingSection);
+  }
+});
+
+/**
+ * Game is starting - show playing order
+ */
+socket.on('gameStart', ({ players, playOrder }) => {
+  console.log('Game started! Playing order:', playOrder);
+  const orderedPlayers = playOrder.map(socketId => 
+    players.find(p => p.socketId === socketId)
+  ).filter(p => p);
+  
+  playerListData = orderedPlayers;
+  window.playerListData = orderedPlayers; // Keep globally accessible
+  updatePlayerList(orderedPlayers, null);
+  
+  // Update mention suggestions with current player list
+  if (window.updatePlayerListForMentions) {
+    window.updatePlayerListForMentions(orderedPlayers);
+  }
+  
+  // Assign colors to players
+  if (window.assignPlayerColors) {
+    window.assignPlayerColors(orderedPlayers);
+  }
+});
 
 /* ===============================
    SORT CARDS LOW → HIGH
@@ -607,33 +913,34 @@ function sortCards(cards) {
     });
 }
 
-    function attemptSingleCardAutoPlay(cardEl) {
-      if (!isMyTurn) return;
-      const isSingleResponse = currentTrickCardCount === 1;
-      const isPowerLeadPlay = currentTrickCardCount === null;
-      if (!isSingleResponse && !isPowerLeadPlay) return;
+function attemptSingleCardAutoPlay(cardEl) {
+  if (!isMyTurn) return;
+  const isSingleResponse = currentTrickCardCount === 1;
+  const isPowerLeadPlay = currentTrickCardCount === null;
+  if (!isSingleResponse && !isPowerLeadPlay) return;
 
-      const cardData = cardEl?.dataset?.card;
-      if (!cardData) return;
+  const cardData = cardEl?.dataset?.card;
+  if (!cardData) return;
 
-      try {
-        const card = JSON.parse(cardData);
-        if (!card || !card.rank || !card.suit) return;
-        socket.emit('playHand', [card]);
-      } catch (e) {
-        // ignore malformed card payload
-      }
-    }
+  try {
+    const card = JSON.parse(cardData);
+    if (!card || !card.rank || !card.suit) return;
+    socket.emit('playHand', [card]);
+  } catch (e) {
+    // ignore malformed card payload
+  }
+}
 
-    function bindCardInteractions(cardEl) {
-      cardEl.addEventListener('click', () => cardEl.classList.toggle('selected'));
-      cardEl.addEventListener('dblclick', () => attemptSingleCardAutoPlay(cardEl));
-      cardEl.draggable = true;
-      cardEl.addEventListener('dragstart', dragStartHandler);
-      cardEl.addEventListener('dragend', dragEndHandler);
-      cardEl.addEventListener('dragover', dragOverHandler);
-      cardEl.addEventListener('drop', dropHandler);
-    }
+function bindCardInteractions(cardEl) {
+  cardEl.addEventListener('click', () => cardEl.classList.toggle('selected'));
+  cardEl.addEventListener('dblclick', () => attemptSingleCardAutoPlay(cardEl));
+  cardEl.draggable = true;
+  cardEl.addEventListener('dragstart', dragStartHandler);
+  cardEl.addEventListener('dragend', dragEndHandler);
+  cardEl.addEventListener('dragover', dragOverHandler);
+  cardEl.addEventListener('drop', dropHandler);
+}
+
 /* ===============================
    RENDER PLAYER HAND
 ================================ */
@@ -952,7 +1259,7 @@ passBtn.addEventListener('click', () => {
 socket.on('updatePlayers', players => {
   if (!playersArea) return;
   playersArea.innerHTML = '';
-
+  
   players.forEach(p => {
     const div = document.createElement('div');
     div.textContent = p.name + (p.ready ? ' ✅' : '');
@@ -985,6 +1292,33 @@ function playTurnChime() {
     o.stop(ctx.currentTime + 0.36);
 
     setTimeout(() => ctx.close(), 500);
+  } catch (e) {
+    // ignore if audio blocked
+  }
+}
+
+function playMentionChime() {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new AudioCtx();
+
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+
+    o.type = 'sine';
+    o.frequency.setValueAtTime(1046, ctx.currentTime); // C6 - higher pitch for mention
+
+    g.gain.setValueAtTime(0.0001, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.25);
+
+    o.connect(g);
+    g.connect(ctx.destination);
+
+    o.start();
+    o.stop(ctx.currentTime + 0.26);
+
+    setTimeout(() => ctx.close(), 400);
   } catch (e) {
     // ignore if audio blocked
   }
@@ -1135,6 +1469,16 @@ socket.on('turnUpdate', ({ playerId, players, playerCount }) => {
   }
 
   lastTurnPlayerId = playerId;
+  
+  // Update player list with stats
+  if (players && players.length > 0) {
+    updatePlayerList(players, playerId);
+  }
+});
+
+// Handle player disconnection - clean up
+socket.on('disconnect', () => {
+  console.log('❌ Disconnected from server');
 });
 
 /* ===============================
@@ -1192,7 +1536,9 @@ socket.on('gameStarted', ({ players, blinds, dealerButton }) => {
   
   console.log('🎮 Texas Hold Em game started');
   console.log(`Small blind: $${blinds.small.toFixed(2)}, Big blind: $${blinds.big.toFixed(2)}`);
-  
+  hideShowMuckChoice();
+  tableFxNewHand();
+
   // Display player seating
   const seatingArea = document.getElementById('seatingArea');
   seatingArea.innerHTML = '';
@@ -1219,12 +1565,12 @@ socket.on('dealCards', ({ holeCards }) => {
   displayGameMessage('Pre-flop betting round', 'info');
 });
 
-socket.on('gameState', ({ state, pot, communityCards, currentBettor, highestBet, smallBlind, bigBlind, players }) => {
+socket.on('gameState', ({ state, pot, communityCards, currentBettor, highestBet, minRaiseTo, smallBlind, bigBlind, dealerId, smallBlindId, bigBlindId, players }) => {
   if (selectedGame !== 'texasHoldEm') return;
   
   // Store current game state for betting validation
   window.currentGameState = {
-    state, pot, communityCards, currentBettor, highestBet, smallBlind, bigBlind, players,
+    state, pot, communityCards, currentBettor, highestBet, minRaiseTo, smallBlind, bigBlind, players,
     playerStack: players.find(p => p.id === mySocketId)?.stack || 0,
     playerCurrentBet: players.find(p => p.id === mySocketId)?.currentBet || 0
   };
@@ -1244,22 +1590,18 @@ socket.on('gameState', ({ state, pot, communityCards, currentBettor, highestBet,
   players.forEach((player, index) => {
     const seatDiv = document.getElementById(`seat-${index}`);
     if (seatDiv) {
-      if (player.folded) {
-        seatDiv.classList.add('folded');
-      } else if (player.allIn) {
-        seatDiv.classList.add('all-in');
-      }
-      
-      if (player.currentBet > 0) {
-        updatePlayerBetDisplay(player.id, player.currentBet);
-      }
+      updateSeatStatus(seatDiv, player, { state, currentBettor, highestBet, dealerId, smallBlindId, bigBlindId });
     }
   });
+  
+  // Bet chips, pot pile, dealer button
+  tableFxUpdate({ state, pot, players, dealerId });
   
   // Show betting controls if it's our turn
   if (currentBettor === mySocketId) {
     showBettingControls({ 
       highestBet: highestBet,
+      minRaiseTo: minRaiseTo,
       playerCurrentBet: players.find(p => p.id === mySocketId)?.currentBet || 0,
       pot: pot || 0,
       playerStack: players.find(p => p.id === mySocketId)?.stack || 0,
@@ -1271,26 +1613,17 @@ socket.on('gameState', ({ state, pot, communityCards, currentBettor, highestBet,
   }
 });
 
-socket.on('gameStateUpdated', ({ state, pot, communityCards, currentBettor, highestBet, smallBlind, bigBlind, players }) => {
+socket.on('gameStateUpdated', ({ state, pot, communityCards, currentBettor, highestBet, minRaiseTo, smallBlind, bigBlind, dealerId, smallBlindId, bigBlindId, players }) => {
   if (selectedGame !== 'texasHoldEm') return;
   
   // Store current game state for betting validation
   window.currentGameState = {
-    state, pot, communityCards, currentBettor, highestBet, smallBlind, bigBlind, players,
+    state, pot, communityCards, currentBettor, highestBet, minRaiseTo, smallBlind, bigBlind, players,
     playerStack: players.find(p => p.id === mySocketId)?.stack || 0,
     playerCurrentBet: players.find(p => p.id === mySocketId)?.currentBet || 0
   };
   
   console.log(`📊 State updated: ${state}`);
-  
-  // Update display based on state
-  if (state === 'flop' && communityCards.length === 3) {
-    displayGameMessage('Flop revealed', 'info');
-  } else if (state === 'turn' && communityCards.length === 4) {
-    displayGameMessage('Turn revealed', 'info');
-  } else if (state === 'river' && communityCards.length === 5) {
-    displayGameMessage('River revealed', 'info');
-  }
   
   // Update pot and community cards
   updatePotDisplay(pot);
@@ -1300,10 +1633,7 @@ socket.on('gameStateUpdated', ({ state, pot, communityCards, currentBettor, high
   players.forEach((player, index) => {
     const seatDiv = document.getElementById(`seat-${index}`);
     if (seatDiv) {
-      seatDiv.classList.remove('folded', 'all-in', 'current-bettor');
-      
       if (player.folded) {
-        seatDiv.classList.add('folded');
         // Trigger fold animation if player just folded
         if (!foldedPlayersThisHand.has(player.id)) {
           foldedPlayersThisHand.add(player.id);
@@ -1312,18 +1642,13 @@ socket.on('gameStateUpdated', ({ state, pot, communityCards, currentBettor, high
           }
         }
       }
-      if (player.allIn) seatDiv.classList.add('all-in');
-      if (player.id === currentBettor) seatDiv.classList.add('current-bettor');
-      
-      // Update stack display
-      const stackDiv = seatDiv.querySelector('.player-stack');
-      if (stackDiv) stackDiv.textContent = `$${player.stack.toFixed(2)}`;
-      
-      if (player.currentBet > 0) {
-        updatePlayerBetDisplay(player.id, player.currentBet);
-      }
+      // Stack, badges, last action, "To call", turn highlight, folded/all-in look
+      updateSeatStatus(seatDiv, player, { state, currentBettor, highestBet, dealerId, smallBlindId, bigBlindId });
     }
   });
+  
+  // Bet chips, pot pile, dealer button
+  tableFxUpdate({ state, pot, players, dealerId });
   
   // Show/hide betting controls
   console.log(`🎲 Current bettor: ${currentBettor}, My ID: ${mySocketId}, Should show controls: ${currentBettor === mySocketId}`);
@@ -1332,6 +1657,7 @@ socket.on('gameStateUpdated', ({ state, pot, communityCards, currentBettor, high
     console.log(`✅ Showing betting controls for ${myPlayer?.name}`);
     showBettingControls({ 
       highestBet: highestBet, 
+      minRaiseTo: minRaiseTo,
       playerCurrentBet: myPlayer?.currentBet || 0,
       pot: pot || 0,
       playerStack: myPlayer?.stack || 0,
@@ -1344,41 +1670,58 @@ socket.on('gameStateUpdated', ({ state, pot, communityCards, currentBettor, high
   }
 });
 
-socket.on('handComplete', ({ winners, winnerNames, pot, method, allHands, sidePotDistribution, winnings }) => {
+socket.on('handComplete', ({ winners, winnerNames, pot, method, allHands, shownHands, sidePotDistribution, winnings, winnerSummary }) => {
   if (selectedGame !== 'texasHoldEm') return;
-  
+
   console.log('🏆 Hand complete!');
+
+  // Slide the pot to the winner(s)
+  tableFxHandComplete({ winnings });
   
-  let message = '';
-  if (method === 'fold') {
-    message = `${winnerNames.join(', ')} won $${pot.toFixed(2)} (everyone else folded)`;
-  } else {
-    // Showdown - show side pots if applicable
-    if (sidePotDistribution && sidePotDistribution.length > 1) {
-      message = '=== Side Pots ===\n';
-      sidePotDistribution.forEach((sidePot, idx) => {
-        message += `Pot ${idx + 1} ($${sidePot.potAmount.toFixed(2)}): ${sidePot.winners.join(', ')}\n`;
-      });
-      message += '\n=== Final Hands ===\n';
-      if (allHands) {
-        message += allHands.map(h => `${h.name}: ${h.hand}`).join('\n');
-      }
-    } else {
-      message = `${winnerNames.join(', ')} won $${pot.toFixed(2)}\n\n=== Final Hands ===\n`;
-      if (allHands) {
-        message += allHands.map(h => `${h.name}: ${h.hand}`).join('\n');
-      }
-    }
-  }
+  // Showdown: turn everyone's cards face up (they stay up until the next deal)
+  (shownHands || []).forEach(h => {
+    if (h.id !== mySocketId) revealSeatCards(h.id, h.cards);
+  });
+
+  // e.g. "T1 wins $1.50 with King high straight" (one line per winner)
+  const message = (winnerSummary || [])
+    .map(w => `${w.name} wins $${w.amount.toFixed(2)}${w.hand ? ` with ${w.hand}` : ''}`)
+    .join('\n');
   
-  displayGameMessage(message, 'info');
+  // Keep the showdown result up as long as the cards are shown
+  displayGameMessage(message, 'info', method === 'showdown' ? 5000 : 3000);
   hideBettingControls();
+});
+
+// I won with everyone else folding: choose to show or muck
+socket.on('offerShowCards', ({ decisionSeconds }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  hideBettingControls();
+  showShowMuckChoice(decisionSeconds);
+});
+
+socket.on('cardsShown', ({ playerId, playerName, cards }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  if (playerId === mySocketId) {
+    hideShowMuckChoice();
+  } else {
+    revealSeatCards(playerId, cards);
+  }
+  displayGameMessage(`${playerName} shows`, 'info', 5000);
+});
+
+socket.on('cardsMucked', ({ playerId, playerName }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  if (playerId === mySocketId) hideShowMuckChoice();
+  displayGameMessage(`${playerName} mucks`, 'info', 1500);
 });
 
 socket.on('newHandStarted', ({ pot, players }) => {
   if (selectedGame !== 'texasHoldEm') return;
-  
+
   console.log('🔄 New hand started');
+  hideShowMuckChoice();
+  tableFxNewHand();
   
   // Reset folded players tracking for new hand
   foldedPlayersThisHand.clear();
@@ -1386,7 +1729,14 @@ socket.on('newHandStarted', ({ pot, players }) => {
   // Clear community cards
   const cardsList = document.getElementById('communityCardsList');
   if (cardsList) cardsList.innerHTML = '';
-  
+
+  // Not dealt into this hand (watching / waiting): clear my old hole cards
+  if (!players.some(p => p.id === mySocketId)) {
+    const myCards = document.getElementById('playerHoleCardsList');
+    if (myCards) myCards.innerHTML = '';
+    hideBettingControls();
+  }
+
   // Update player stacks and show their table cards
   players.forEach((player, index) => {
     const seatDiv = document.getElementById(`seat-${index}`);
@@ -1420,41 +1770,23 @@ socket.on('youBusted', ({ bustedAmount, minRebuy, maxRebuy, suggestedRebuy }) =>
   console.log('💔 You are busted! Stack: $' + bustedAmount.toFixed(2));
   
   displayGameMessage('You are busted! Choose to rebuy or watch.', 'warning');
-  
+  hideBettingControls();
+  // The Re-buy button stays on screen until a re-buy goes through
+  if (typeof REBUY_LIMITS !== 'undefined') {
+    REBUY_LIMITS.min = minRebuy;
+    REBUY_LIMITS.max = maxRebuy;
+    REBUY_LIMITS.suggested = suggestedRebuy;
+  }
+  showRebuyButton();
+
   // Show rebuy/watch options
-  const choice = confirm(`You lost all your chips!\n\nClick OK to rebuy or Cancel to watch.`);
-  
+  const choice = confirm(`You lost all your chips!\n\nClick OK to rebuy now, or Cancel to watch.\n(You can re-buy any time with the Re-buy button.)`);
+
   if (choice) {
-    // Rebuy
-    const rebuyAmount = prompt(
-      `Rebuy amount?\n(Minimum: $${minRebuy.toFixed(2)}, Maximum: $${maxRebuy.toFixed(2)}, Suggested: $${suggestedRebuy.toFixed(2)})`,
-      suggestedRebuy.toFixed(2)
-    );
-    
-    if (rebuyAmount === null) {
-      // User cancelled - show watch option
-      socket.emit('chooseToWatch', { roomId });
-      displayGameMessage('You are now watching the game', 'info');
-      hideBettingControls();
-      return;
-    }
-    
-    const amount = parseFloat(rebuyAmount);
-    if (isNaN(amount) || amount < minRebuy || amount > maxRebuy) {
-      alert(`Invalid amount. Must be between $${minRebuy.toFixed(2)} and $${maxRebuy.toFixed(2)}`);
-      socket.emit('chooseToWatch', { roomId });
-      displayGameMessage('You are now watching the game', 'info');
-      hideBettingControls();
-      return;
-    }
-    
-    socket.emit('submitRebuy', { roomId, rebuyAmount: amount });
-    displayGameMessage(`Rebuying for $${amount.toFixed(2)}...`, 'info');
+    promptRebuy();
   } else {
-    // Watch
     socket.emit('chooseToWatch', { roomId });
-    displayGameMessage('You are now watching the game', 'info');
-    hideBettingControls();
+    displayGameMessage('You are now watching. Click Re-buy any time to get back in.', 'info');
   }
 });
 
@@ -1475,7 +1807,12 @@ socket.on('playerRebuyin', ({ playerId, playerName, rebuyAmount }) => {
   if (selectedGame !== 'texasHoldEm') return;
   
   console.log(`${playerName} rebuys for $${rebuyAmount.toFixed(2)}`);
-  displayGameMessage(`${playerName} rebuys for $${rebuyAmount.toFixed(2)}`, 'info');
+  if (playerId === mySocketId) {
+    hideRebuyButton();
+    displayGameMessage(`You re-bought for $${rebuyAmount.toFixed(2)}. You'll be dealt in when the next hand starts.`, 'info');
+  } else {
+    displayGameMessage(`${playerName} rebuys for $${rebuyAmount.toFixed(2)}`, 'info');
+  }
 });
 
 socket.on('playerWatching', ({ playerId, playerName }) => {
@@ -1489,5 +1826,10 @@ socket.on('playerRejoinedGame', ({ playerId, playerName, buyInAmount }) => {
   if (selectedGame !== 'texasHoldEm') return;
   
   console.log(`${playerName} rejoined for $${buyInAmount.toFixed(2)}`);
-  displayGameMessage(`${playerName} rejoined the game with $${buyInAmount.toFixed(2)}`, 'info');
+  if (playerId === mySocketId) {
+    hideRebuyButton();
+    displayGameMessage(`You re-bought for $${buyInAmount.toFixed(2)}. You'll be dealt in when the next hand starts.`, 'info');
+  } else {
+    displayGameMessage(`${playerName} rejoined the game with $${buyInAmount.toFixed(2)}`, 'info');
+  }
 });

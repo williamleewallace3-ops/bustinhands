@@ -475,6 +475,21 @@ io.on('connection', (socket) => {
         ready: !!ready[roomId][p.socket.id]
       })));
       
+      // Emit active players list with stats for the player list panel
+      const activePlayersData = inGame[roomId].map(socketId => {
+        const player = rooms[roomId].find(p => p.socket.id === socketId);
+        if (!player) return null;
+        const stats = playerStats[player.name] || { wins: 0, gamesPlayed: 0 };
+        return {
+          socketId: socketId,
+          name: player.name,
+          wins: stats.wins,
+          gamesPlayed: stats.gamesPlayed,
+          cardsRemaining: 0 // Will be updated during game
+        };
+      }).filter(x => x);
+      io.to(roomId).emit('activePlayersListUpdate', activePlayersData);
+      
       const waiting = waitingRoom[roomId].map(sid => {
         const p = rooms[roomId].find(pl => pl.socket.id === sid);
         return p ? { socketId: p.socket.id, name: p.name } : null;
@@ -545,25 +560,24 @@ io.on('connection', (socket) => {
       return;
     }
 
-    buyInAmount = parseFloat(buyInAmount) || 0;
-    if (buyInAmount < 1 || buyInAmount > 1000) {
+    const playerData = holdEmPlayerData[roomId][socket.id];
+    if (playerData.buyIn > 0) {
+      socket.emit('errorMessage', 'You have already bought in');
+      return;
+    }
+
+    buyInAmount = Math.round((parseFloat(buyInAmount) || 0) * 100) / 100;
+    if (buyInAmount < HOLDEM_BUY_IN.minBuyIn || buyInAmount > HOLDEM_BUY_IN.maxBuyIn) {
       socket.emit('errorMessage', 'Buy-in must be between $1 and $1000');
       return;
     }
 
-    const playerData = holdEmPlayerData[roomId][socket.id];
     playerData.buyIn = buyInAmount;
     playerData.stack = buyInAmount;
-    playerData.ready = false; // Player must click ready to start game
+    playerData.status = 'active';
+    playerData.ready = false; // Player must click ready to be dealt in
 
-    console.log(`🤠 ${playerData.name} bought in for $${buyInAmount.toFixed(2)}. Waiting for ready...`);
-
-    // Broadcast updated player list
-    const allPlayers = Object.values(holdEmPlayerData[roomId])
-      .filter(p => p.stack > 0)
-      .map(p => ({ id: p.socket.id, name: p.name, ready: p.ready, stack: p.stack }));
-
-    io.to(roomId).emit('playersUpdated', allPlayers);
+    broadcastHoldEmLobby(roomId);
   });
 
   /**
@@ -582,363 +596,63 @@ io.on('connection', (socket) => {
     }
 
     playerData.ready = true;
-    console.log(`✋ ${playerData.name} is ready!`);
+    broadcastHoldEmLobby(roomId);
 
-    // Broadcast updated player list
-    const allPlayers = Object.values(holdEmPlayerData[roomId])
-      .filter(p => p.stack > 0)
-      .map(p => ({ id: p.socket.id, name: p.name, ready: p.ready, stack: p.stack }));
+    const game = holdEmGames[roomId];
+    if (!game || game.handInProgress || game.nextHandTimer) {
+      return; // A hand is being played: they'll be dealt in when the next one starts
+    }
 
-    io.to(roomId).emit('playersUpdated', allPlayers);
+    if (game.handsPlayed > 0) {
+      // Game was paused waiting for players: resume as soon as 2 can play
+      startNextHoldEmHand(roomId);
+      return;
+    }
 
-    // Check if all players are ready (at least 2 players with stack)
-    const playersWithStack = Object.values(holdEmPlayerData[roomId]).filter(p => p.stack > 0);
-    const readyPlayers = playersWithStack.filter(p => p.ready);
-
-    if (playersWithStack.length >= 2 && readyPlayers.length === playersWithStack.length) {
-      console.log(`🤠 All ${readyPlayers.length} players ready! Starting Texas Hold 'Em game`);
-      
-      // Initialize players in game engine
-      const game = holdEmGames[roomId];
-      game.players = readyPlayers.map((p, idx) => ({
-        id: p.socket.id,
-        name: p.name,
-        stack: p.stack,
-        currentBet: 0
-      }));
-
-      // Start first hand
-      texasHoldEmEngine.startNewHand(game);
-      
-      // Notify all players - game started
-      io.to(roomId).emit('gameStarted', {
-        players: game.players.map(p => ({ id: p.id, name: p.name, stack: p.stack })),
-        blinds: { small: game.smallBlind, big: game.bigBlind },
-        dealerButton: game.dealerButton
-      });
-
-      // Send hole cards to each player
-      game.players.forEach(player => {
-        const playerSocket = holdEmPlayerData[roomId][player.id]?.socket;
-        if (playerSocket) {
-          playerSocket.emit('dealCards', {
-            holeCards: game.playerHands[player.id]
-          });
-        }
-      });
-
-      // Broadcast community cards (none yet, but send state)
-      console.log(`📡 Sending initial gameState: currentBettor=${game.currentBettor}, players: ${game.players.map(p => `${p.name}(${p.id})`).join(', ')}`);
-      io.to(roomId).emit('gameState', {
-        state: game.state,
-        pot: game.pot,
-        communityCards: game.communityCards,
-        currentBettor: game.currentBettor,
-        highestBet: game.highestBet,
-        smallBlind: game.smallBlind,
-        bigBlind: game.bigBlind,
-        players: game.players.map(p => ({ id: p.id, name: p.name, stack: p.stack, currentBet: p.currentBet }))
-      });
-      console.log(`✅ gameState sent`);
+    // First hand: wait until everyone who has bought in is ready
+    const withStack = Object.values(holdEmPlayerData[roomId]).filter(p => p.stack > 0);
+    if (withStack.length >= 2 && withStack.every(p => p.ready)) {
+      startNextHoldEmHand(roomId);
     }
   });
 
   /**
-   * Handle Texas Hold 'Em player actions (bet, call, fold, etc.)
+   * Handle Texas Hold 'Em player actions (fold, check, call, bet, raise)
+   * For bet/raise, amount is the total to raise to.
    */
   socket.on('pokerAction', ({ roomId, gameType, action, amount }) => {
-    console.log(`♠️ pokerAction received: gameType=${gameType}, action=${action}, amount=${amount}`);
-    
-    if (gameType !== 'texasHoldEm' || !holdEmGames[roomId]) {
-      console.log(`❌ Invalid game or no game found for ${roomId}`);
+    const game = holdEmGames[roomId];
+    if (gameType !== 'texasHoldEm' || !game) {
       socket.emit('errorMessage', 'Invalid game');
       return;
     }
 
-    const game = holdEmGames[roomId];
-    
-    if (game.currentBettor !== socket.id) {
-      console.log(`❌ Not your turn. Current bettor: ${game.currentBettor}, Your ID: ${socket.id}`);
-      socket.emit('errorMessage', 'Not your turn');
-      return;
-    }
-
-    const player = game.players.find(p => p.id === socket.id);
-    if (!player) {
-      console.log(`❌ Player not found`);
-      socket.emit('errorMessage', 'Player not found');
-      return;
-    }
-
-    console.log(`✅ Processing action: ${action} for player ${player.name}`);
-    
-    // Handle the action
-    const result = texasHoldEmEngine.handlePlayerAction(game, socket.id, action, amount);
-    
+    const result = texasHoldEmEngine.handlePlayerAction(game, socket.id, action, parseFloat(amount) || 0);
     if (result.error) {
-      console.log(`❌ Action error: ${result.error}`);
       socket.emit('errorMessage', result.error);
       return;
     }
+    processHoldEmResult(roomId, result);
+  });
 
-    // Check if we need to auto-advance remaining streets (all-in scenario)
-    if (result.autoAdvanceNeeded) {
-      console.log(`🎯 Auto-dealing remaining streets...`);
-      
-      // First, broadcast current state
-      io.to(roomId).emit('gameStateUpdated', {
-        state: game.state,
-        pot: game.pot,
-        communityCards: game.communityCards,
-        currentBettor: game.currentBettor,
-        highestBet: game.highestBet,
-        smallBlind: game.smallBlind,
-        bigBlind: game.bigBlind,
-        players: game.players.map(p => ({ 
-          id: p.id, 
-          name: p.name, 
-          stack: p.stack, 
-          currentBet: p.currentBet,
-          folded: game.foldedPlayers.has(p.id),
-          allIn: game.allInPlayers.has(p.id)
-        }))
+  /**
+   * Winner of a hand where everyone else folded chooses to show or muck.
+   */
+  socket.on('showOrMuck', ({ roomId, show }) => {
+    const game = holdEmGames[roomId];
+    if (!game || !game.showOffer || game.showOffer.playerId !== socket.id) return;
+    game.showOffer = null;
+
+    if (show) {
+      io.to(roomId).emit('cardsShown', {
+        playerId: socket.id,
+        playerName: socket.playerName,
+        cards: game.playerHands[socket.id] || []
       });
-      
-      // Auto-advance remaining streets with 3-second delays
-      let streetCount = 0;
-      
-      const advanceAndBroadcast = () => {
-        streetCount++;
-        
-        // Advance one street
-        const isDone = texasHoldEmEngine.autoAdvanceOneStreet(game);
-        
-        console.log(`🎰 Auto-advance street ${streetCount}, new state: ${game.state}`);
-        
-        // Broadcast updated state
-        io.to(roomId).emit('gameStateUpdated', {
-          state: game.state,
-          pot: game.pot,
-          communityCards: game.communityCards,
-          currentBettor: game.currentBettor,
-          highestBet: game.highestBet,
-          smallBlind: game.smallBlind,
-          bigBlind: game.bigBlind,
-          players: game.players.map(p => ({ 
-            id: p.id, 
-            name: p.name, 
-            stack: p.stack, 
-            currentBet: p.currentBet,
-            folded: game.foldedPlayers.has(p.id),
-            allIn: game.allInPlayers.has(p.id)
-          }))
-        });
-        
-        // If we've reached showdown, stop and determine winner
-        if (isDone) {
-          console.log(`🎯 All streets dealt, determining winner...`);
-          
-          setTimeout(() => {
-            const winnerResult = texasHoldEmEngine.determineWinner(game);
-            
-            io.to(roomId).emit('handComplete', {
-              winners: winnerResult.winners,
-              winnerNames: winnerResult.winnerNames,
-              pot: winnerResult.pot,
-              method: winnerResult.method,
-              allHands: winnerResult.allHands,
-              sidePotDistribution: winnerResult.sidePotDistribution,
-              winnings: winnerResult.winnings
-            });
-
-            // Check for busted players
-            for (const player of game.players) {
-              if (player.stack <= 0 && holdEmPlayerData[roomId][player.id]) {
-                holdEmPlayerData[roomId][player.id].status = 'busted';
-                holdEmPlayerData[roomId][player.id].stack = 0;
-                holdEmBustedPlayers[roomId] = holdEmBustedPlayers[roomId] || new Set();
-                holdEmBustedPlayers[roomId].add(player.id);
-                
-                // Notify busted player
-                const playerSocket = holdEmPlayerData[roomId][player.id].socket;
-                if (playerSocket) {
-                  playerSocket.emit('youBusted', {
-                    bustedAmount: player.stack,
-                    minRebuy: 1.00,
-                    maxRebuy: 1000.00,
-                    suggestedRebuy: 10.00
-                  });
-                }
-              }
-            }
-
-            // Reset for next hand
-            setTimeout(() => {
-              const activePlayers = game.players.filter(p => p.stack > 0);
-              
-              if (activePlayers.length < 2) {
-                console.log(`🤠 Waiting for rebuys in room ${roomId}`);
-                io.to(roomId).emit('waitingForRebuys', {
-                  activePlayers: activePlayers.map(p => ({ id: p.id, name: p.name, stack: p.stack })),
-                  bustOut: Array.from(holdEmBustedPlayers[roomId] || []).map(id => ({
-                    id,
-                    name: holdEmPlayerData[roomId][id]?.name
-                  }))
-                });
-              } else {
-                game.players = activePlayers;
-                texasHoldEmEngine.startNewHand(game);
-                
-                io.to(roomId).emit('newHandStarted', {
-                  pot: game.pot,
-                  players: game.players.map(p => ({ id: p.id, name: p.name, stack: p.stack }))
-                });
-
-                game.players.forEach(player => {
-                  const playerSocket = holdEmPlayerData[roomId][player.id]?.socket;
-                  if (playerSocket) {
-                    playerSocket.emit('dealCards', {
-                      holeCards: game.playerHands[player.id]
-                    });
-                  }
-                });
-
-                io.to(roomId).emit('gameState', {
-                  state: game.state,
-                  pot: game.pot,
-                  communityCards: game.communityCards,
-                  currentBettor: game.currentBettor,
-                  highestBet: game.highestBet,
-                  smallBlind: game.smallBlind,
-                  bigBlind: game.bigBlind,
-                  players: game.players.map(p => ({ id: p.id, name: p.name, stack: p.stack, currentBet: p.currentBet }))
-                });
-              }
-            }, 3000);
-          }, 3000);
-        } else {
-          // Schedule next street reveal in 3 seconds
-          setTimeout(() => {
-            advanceAndBroadcast();
-          }, 3000);
-        }
-      };
-      
-      // Start the auto-advance sequence with 3-second initial delay
-      setTimeout(() => {
-        advanceAndBroadcast();
-      }, 3000);
-      
-      return;
-    }
-
-    // Check if hand is over (showdown or everyone folded)
-    if (game.state === 'showdown') {
-      const winnerResult = texasHoldEmEngine.determineWinner(game);
-      
-      io.to(roomId).emit('handComplete', {
-        winners: winnerResult.winners,
-        winnerNames: winnerResult.winnerNames,
-        pot: winnerResult.pot,
-        method: winnerResult.method,
-        allHands: winnerResult.allHands,
-        sidePotDistribution: winnerResult.sidePotDistribution,
-        winnings: winnerResult.winnings
-      });
-
-      // Check for busted players
-      for (const player of game.players) {
-        if (player.stack <= 0 && holdEmPlayerData[roomId][player.id]) {
-          holdEmPlayerData[roomId][player.id].status = 'busted';
-          holdEmPlayerData[roomId][player.id].stack = 0;
-          holdEmBustedPlayers[roomId] = holdEmBustedPlayers[roomId] || new Set();
-          holdEmBustedPlayers[roomId].add(player.id);
-          
-          // Notify busted player
-          const playerSocket = holdEmPlayerData[roomId][player.id].socket;
-          if (playerSocket) {
-            playerSocket.emit('youBusted', {
-              bustedAmount: player.stack,
-              minRebuy: 1.00,
-              maxRebuy: 1000.00,
-              suggestedRebuy: 10.00
-            });
-          }
-        }
-      }
-
-      // Reset for next hand (continuous game)
-      setTimeout(() => {
-        // Only keep players with stacks > 0 for next hand
-        const activePlayers = game.players.filter(p => p.stack > 0);
-        
-        if (activePlayers.length < 2) {
-          // Not enough players to continue - wait for rebuys
-          console.log(`🤠 Waiting for rebuys in room ${roomId}. Active: ${activePlayers.length}`);
-          io.to(roomId).emit('waitingForRebuys', {
-            activePlayers: activePlayers.map(p => ({ id: p.id, name: p.name, stack: p.stack })),
-            bustOut: Array.from(holdEmBustedPlayers[roomId] || []).map(id => ({
-              id,
-              name: holdEmPlayerData[roomId][id]?.name
-            }))
-          });
-        } else {
-          // Start next hand with remaining players
-          game.players = activePlayers;
-          texasHoldEmEngine.startNewHand(game);
-          
-          io.to(roomId).emit('newHandStarted', {
-            pot: game.pot,
-            players: game.players.map(p => ({ id: p.id, name: p.name, stack: p.stack }))
-          });
-
-          // Send hole cards to each player
-          game.players.forEach(player => {
-            const playerSocket = holdEmPlayerData[roomId][player.id]?.socket;
-            if (playerSocket) {
-              playerSocket.emit('dealCards', {
-                holeCards: game.playerHands[player.id]
-              });
-            }
-          });
-
-          // Broadcast initial game state for new hand
-          console.log(`📡 Sending gameState for new hand: currentBettor=${game.currentBettor}, players: ${game.players.map(p => `${p.name}(${p.id})`).join(', ')}`);
-          io.to(roomId).emit('gameState', {
-            state: game.state,
-            pot: game.pot,
-            communityCards: game.communityCards,
-            currentBettor: game.currentBettor,
-            highestBet: game.highestBet,
-            smallBlind: game.smallBlind,
-            bigBlind: game.bigBlind,
-            players: game.players.map(p => ({ id: p.id, name: p.name, stack: p.stack, currentBet: p.currentBet }))
-          });
-          console.log(`✅ gameState sent for new hand`);
-        }
-      }, 3000);
+      scheduleNextHoldEmHand(roomId, HOLDEM_SHOWN_CARDS_DELAY);
     } else {
-      // Broadcast game state update
-      const myPlayerStack = game.players.find(p => p.id === socket.id)?.stack || 0;
-      console.log(`🎲 Broadcasting gameStateUpdated: currentBettor=${game.currentBettor}, state=${game.state}`);
-      io.to(roomId).emit('gameStateUpdated', {
-        state: game.state,
-        pot: game.pot,
-        communityCards: game.communityCards,
-        currentBettor: game.currentBettor,
-        highestBet: game.highestBet,
-        smallBlind: game.smallBlind,
-        bigBlind: game.bigBlind,
-        playerStack: myPlayerStack,
-        players: game.players.map(p => ({ 
-          id: p.id, 
-          name: p.name, 
-          stack: p.stack, 
-          currentBet: p.currentBet,
-          folded: game.foldedPlayers.has(p.id),
-          allIn: game.allInPlayers.has(p.id)
-        }))
-      });
+      io.to(roomId).emit('cardsMucked', { playerId: socket.id, playerName: socket.playerName });
+      scheduleNextHoldEmHand(roomId, HOLDEM_MUCK_DELAY);
     }
   });
 
@@ -946,40 +660,38 @@ io.on('connection', (socket) => {
    * Handle blind change request (Texas Hold 'Em)
    */
   socket.on('requestBlindChange', ({ roomId, smallBlind, bigBlind }) => {
-    if (!holdEmGames[roomId]) {
+    const game = holdEmGames[roomId];
+    if (!game) {
       socket.emit('errorMessage', 'Game not found');
       return;
     }
 
-    const game = holdEmGames[roomId];
     const result = texasHoldEmEngine.requestBlindChange(game, socket.id, smallBlind, bigBlind);
-
     if (result.error) {
       socket.emit('errorMessage', result.error);
       return;
     }
 
-    // Notify all players of blind change request
     io.to(roomId).emit('blindChangeProposed', {
       proposedBy: socket.playerName,
-      smallBlind,
-      bigBlind,
-      votesNeeded: Math.ceil(game.players.length * 2 / 3)
+      smallBlind: game.blindChangeRequest.smallBlind,
+      bigBlind: game.blindChangeRequest.bigBlind,
+      votesReceived: result.votesReceived,
+      votesNeeded: result.votesNeeded
     });
   });
 
   /**
-   * Vote on blind change (Texas Hold 'Em)
+   * Vote on blind change (Texas Hold 'Em). One "no" vote cancels the request.
    */
   socket.on('voteBlindChange', ({ roomId, approve }) => {
-    if (!holdEmGames[roomId]) {
+    const game = holdEmGames[roomId];
+    if (!game) {
       socket.emit('errorMessage', 'Game not found');
       return;
     }
 
-    const game = holdEmGames[roomId];
     const result = texasHoldEmEngine.voteOnBlindChange(game, socket.id, approve);
-
     if (result.error) {
       socket.emit('errorMessage', result.error);
       return;
@@ -989,11 +701,13 @@ io.on('connection', (socket) => {
       io.to(roomId).emit('blindsChanged', {
         smallBlind: result.newBlinds.smallBlind,
         bigBlind: result.newBlinds.bigBlind,
-        effectiveNextHand: true
+        effectiveNextHand: game.handInProgress
       });
+    } else if (result.rejected) {
+      io.to(roomId).emit('blindChangeRejected', { rejectedBy: socket.playerName });
     } else if (result.pending) {
       io.to(roomId).emit('voteUpdate', {
-        votesReceived: result.votesNeeded,
+        votesReceived: result.votesReceived,
         votesNeeded: result.votesNeeded
       });
     }
@@ -1014,49 +728,19 @@ io.on('connection', (socket) => {
       return;
     }
 
-    rebuyAmount = parseFloat(rebuyAmount) || 0;
-    if (rebuyAmount < 1 || rebuyAmount > 1000) {
+    rebuyAmount = Math.round((parseFloat(rebuyAmount) || 0) * 100) / 100;
+    if (rebuyAmount < HOLDEM_BUY_IN.minBuyIn || rebuyAmount > HOLDEM_BUY_IN.maxBuyIn) {
       socket.emit('errorMessage', 'Rebuy must be between $1 and $1000');
       return;
     }
 
-    // Update player data
-    playerData.stack = rebuyAmount;
-    playerData.status = 'active';
-    playerData.ready = true;
-
-    console.log(`🤠 ${playerData.name} rebuys for $${rebuyAmount.toFixed(2)}`);
-
-    // Remove from busted set
-    if (holdEmBustedPlayers[roomId]) {
-      holdEmBustedPlayers[roomId].delete(socket.id);
-    }
-
-    // Add back to game on next hand
-    const game = holdEmGames[roomId];
-    if (game) {
-      // If not already in game, add them
-      if (!game.players.find(p => p.id === socket.id)) {
-        game.players.push({
-          id: socket.id,
-          name: playerData.name,
-          stack: rebuyAmount,
-          currentBet: 0,
-          ready: true
-        });
-      } else {
-        // Already in game, just update stack
-        const p = game.players.find(p => p.id === socket.id);
-        if (p) p.stack = rebuyAmount;
-      }
-    }
-
-    // Notify all players
+    seatHoldEmPlayerForNextHand(roomId, socket.id, rebuyAmount);
     io.to(roomId).emit('playerRebuyin', {
       playerId: socket.id,
       playerName: playerData.name,
       rebuyAmount
     });
+    resumeHoldEmIfPaused(roomId);
   });
 
   /**
@@ -1070,10 +754,8 @@ io.on('connection', (socket) => {
 
     const playerData = holdEmPlayerData[roomId][socket.id];
     playerData.status = 'watching';
+    playerData.ready = false;
 
-    console.log(`🤠 ${playerData.name} is watching`);
-
-    // Notify all players
     io.to(roomId).emit('playerWatching', {
       playerId: socket.id,
       playerName: playerData.name
@@ -1081,7 +763,8 @@ io.on('connection', (socket) => {
   });
 
   /**
-   * Handle player who was watching choosing to rejoin (Texas Hold 'Em)
+   * Re-buy from the Re-buy button (Texas Hold 'Em): works any time while
+   * busted or watching; they're dealt in when the next hand starts.
    */
   socket.on('rejoinGame', ({ roomId, buyInAmount }) => {
     if (!holdEmPlayerData[roomId] || !holdEmPlayerData[roomId][socket.id]) {
@@ -1090,47 +773,24 @@ io.on('connection', (socket) => {
     }
 
     const playerData = holdEmPlayerData[roomId][socket.id];
-    if (playerData.status !== 'watching') {
-      socket.emit('errorMessage', 'Can only rejoin if watching');
+    if (playerData.status !== 'watching' && playerData.status !== 'busted') {
+      socket.emit('errorMessage', 'You still have chips - no need to re-buy');
       return;
     }
 
-    buyInAmount = parseFloat(buyInAmount) || 0;
-    if (buyInAmount < 1 || buyInAmount > 1000) {
+    buyInAmount = Math.round((parseFloat(buyInAmount) || 0) * 100) / 100;
+    if (buyInAmount < HOLDEM_BUY_IN.minBuyIn || buyInAmount > HOLDEM_BUY_IN.maxBuyIn) {
       socket.emit('errorMessage', 'Buy-in must be between $1 and $1000');
       return;
     }
 
-    // Update player data
-    playerData.stack = buyInAmount;
-    playerData.status = 'active';
-    playerData.ready = true;
-
-    console.log(`🤠 ${playerData.name} rejoin game with $${buyInAmount.toFixed(2)}`);
-
-    // Add to game
-    const game = holdEmGames[roomId];
-    if (game) {
-      if (!game.players.find(p => p.id === socket.id)) {
-        game.players.push({
-          id: socket.id,
-          name: playerData.name,
-          stack: buyInAmount,
-          currentBet: 0,
-          ready: true
-        });
-      } else {
-        const p = game.players.find(p => p.id === socket.id);
-        if (p) p.stack = buyInAmount;
-      }
-    }
-
-    // Notify all players
+    seatHoldEmPlayerForNextHand(roomId, socket.id, buyInAmount);
     io.to(roomId).emit('playerRejoinedGame', {
       playerId: socket.id,
       playerName: playerData.name,
       buyInAmount
     });
+    resumeHoldEmIfPaused(roomId);
   });
 
   socket.on('revealHand', () => {
@@ -1481,7 +1141,7 @@ if (!firstPlayDone[roomId]) {
       io.to(roomId).emit('powerTaken', {
         playerId: socket.id,
         playerName: socket.playerName || 'A player',
-        card: { rank: '2', suit: 'D' }
+        cards: playedCards
       });
 
       // Clear trick
@@ -1604,41 +1264,296 @@ if (!firstPlayDone[roomId]) {
     }).filter(x => x);
     io.to(roomId).emit('waitingList', waiting);
     }
-    // Handle Texas Hold 'Em disconnection
+    // Handle Texas Hold 'Em disconnection: the player folds and their chips stay in the pot
     else if (gameType === 'texasHoldEm' && holdEmPlayerData[roomId]) {
-      if (holdEmPlayerData[roomId][socket.id]) {
-        delete holdEmPlayerData[roomId][socket.id];
-      }
+      delete holdEmPlayerData[roomId][socket.id];
+      if (holdEmBustedPlayers[roomId]) holdEmBustedPlayers[roomId].delete(socket.id);
+      io.to(roomId).emit('playerDisconnected', { socketId: socket.id });
 
-      // If player is in game, remove from active game
       const game = holdEmGames[roomId];
       if (game) {
-        game.players = game.players.filter(p => p.id !== socket.id);
-        game.activePlayers = game.activePlayers.filter(id => id !== socket.id);
-        game.foldedPlayers.delete(socket.id);
-        game.allInPlayers.delete(socket.id);
-
-        // If it was their turn, advance to next player
-        if (game.currentBettor === socket.id) {
-          const activePlayers = game.players.filter(p => !game.foldedPlayers.has(p.id));
-          if (activePlayers.length > 0) {
-            game.currentBettor = activePlayers[0].id;
-          }
-        }
-
-        // Broadcast player disconnection
-        io.to(roomId).emit('playerDisconnected', { socketId: socket.id });
+        processHoldEmResult(roomId, texasHoldEmEngine.removePlayer(game, socket.id));
       }
 
       // Clean up room if empty
       if (Object.keys(holdEmPlayerData[roomId]).length === 0) {
+        if (game) {
+          clearTimeout(game.runOutTimer);
+          clearTimeout(game.nextHandTimer);
+        }
         delete holdEmGames[roomId];
         delete holdEmPlayerData[roomId];
+        delete holdEmBustedPlayers[roomId];
         delete roomGameTypes[roomId];
       }
     }
   });
+
+  /* ===============================
+     CHAT MESSAGING
+  ================================ */
+  socket.on("chatMessage", ({ playerName, message, roomId }) => {
+    if (!roomId || !message || !message.trim()) return;
+    
+    // Parse @mentions and notify mentioned players
+    const mentionPattern = /@(\w+)/g;
+    let match;
+    const mentionedPlayers = new Set();
+    
+    while ((match = mentionPattern.exec(message)) !== null) {
+      const mentionedName = match[1];
+      mentionedPlayers.add(mentionedName);
+    }
+    
+    // Send mention alerts to mentioned players
+    if (mentionedPlayers.size > 0) {
+      const playersInRoom = rooms[roomId] || [];
+      playersInRoom.forEach(p => {
+        if (mentionedPlayers.has(p.name)) {
+          p.socket.emit('mentionAlert', { mentioner: playerName, message: message.trim() });
+        }
+      });
+    }
+    
+    // Broadcast chat message to all players
+    io.to(roomId).emit("chatMessage", { playerName, message: message.trim() });
+  });
 });
+
+/* ===============================
+   TEXAS HOLD 'EM GAME FLOW
+================================ */
+const HOLDEM_BUY_IN = { minBuyIn: 1.00, maxBuyIn: 1000.00, suggestedBuyIn: 10.00 };
+const HOLDEM_STEP_DELAY = 3000; // ms between run-out streets, and between hands
+const HOLDEM_MAX_SEATS = 9;     // seats around the table (the seat layout fits up to 9)
+const HOLDEM_SHOWDOWN_DELAY = 5000;      // ms everyone's cards stay face up after a showdown
+const HOLDEM_SHOW_DECISION_TIME = 6000;  // ms a fold-win winner has to choose Show or Muck
+const HOLDEM_SHOWN_CARDS_DELAY = 5000;   // ms a winner's shown cards stay face up
+const HOLDEM_MUCK_DELAY = 1500;          // ms before the next deal after a muck
+
+function holdEmStatePayload(game) {
+  return {
+    state: game.state,
+    pot: game.pot,
+    communityCards: game.communityCards,
+    currentBettor: game.currentBettor,
+    highestBet: game.highestBet,
+    minRaiseTo: texasHoldEmEngine.getMinRaiseTo(game),
+    smallBlind: game.smallBlind,
+    bigBlind: game.bigBlind,
+    dealerId: game.players[game.dealerButton]?.id || null,
+    smallBlindId: game.players[game.smallBlindPos]?.id || null,
+    bigBlindId: game.players[game.bigBlindPos]?.id || null,
+    players: game.players.map(p => ({
+      id: p.id,
+      name: p.name,
+      stack: p.stack,
+      currentBet: p.currentBet,
+      folded: game.foldedPlayers.has(p.id),
+      allIn: game.allInPlayers.has(p.id),
+      lastAction: (game.lastActions && game.lastActions[p.id]) || ''
+    }))
+  };
+}
+
+function broadcastHoldEmState(roomId, event = 'gameStateUpdated') {
+  const game = holdEmGames[roomId];
+  if (game) io.to(roomId).emit(event, holdEmStatePayload(game));
+}
+
+/** Lobby list: everyone who has bought in and still has chips */
+function broadcastHoldEmLobby(roomId) {
+  const players = Object.values(holdEmPlayerData[roomId] || {})
+    .filter(p => p.stack > 0)
+    .map(p => ({ id: p.socket.id, name: p.name, ready: p.ready, stack: p.stack }));
+  io.to(roomId).emit('playersUpdated', players);
+}
+
+/**
+ * React to what the engine returned after an action, a new hand, or a player leaving.
+ */
+function processHoldEmResult(roomId, result) {
+  const game = holdEmGames[roomId];
+  if (!game || !result || result.error) return;
+
+  broadcastHoldEmState(roomId);
+  if (result.handComplete) {
+    finishHoldEmHand(roomId, result.handComplete);
+  } else if (result.autoAdvanceNeeded) {
+    runOutHoldEmBoard(roomId);
+  }
+}
+
+/** Nobody can bet any more: deal the remaining streets every few seconds, then show down. */
+function runOutHoldEmBoard(roomId) {
+  const game = holdEmGames[roomId];
+  const stillThisHand = () => holdEmGames[roomId] === game && game.handInProgress;
+
+  const step = () => {
+    if (!stillThisHand()) return;
+    const boardComplete = texasHoldEmEngine.autoAdvanceOneStreet(game);
+    broadcastHoldEmState(roomId);
+    if (boardComplete) {
+      game.runOutTimer = setTimeout(() => {
+        if (!stillThisHand()) return;
+        finishHoldEmHand(roomId, texasHoldEmEngine.determineWinner(game));
+      }, HOLDEM_STEP_DELAY);
+    } else {
+      game.runOutTimer = setTimeout(step, HOLDEM_STEP_DELAY);
+    }
+  };
+  clearTimeout(game.runOutTimer);
+  game.runOutTimer = setTimeout(step, HOLDEM_STEP_DELAY);
+}
+
+/** Announce the result, save stacks, handle busted players, and queue the next hand. */
+function finishHoldEmHand(roomId, result) {
+  const game = holdEmGames[roomId];
+  const data = holdEmPlayerData[roomId] || {};
+  if (!game) return;
+  clearTimeout(game.runOutTimer);
+
+  io.to(roomId).emit('handComplete', {
+    winners: result.winners,
+    winnerNames: result.winnerNames,
+    pot: result.pot,
+    method: result.method,
+    allHands: result.allHands,
+    shownHands: result.shownHands || [], // showdown: everyone's cards face up
+    sidePotDistribution: result.sidePotDistribution,
+    winnings: result.winnings,
+    winnerSummary: result.winnerSummary || []
+  });
+
+  for (const player of game.players) {
+    const playerData = data[player.id];
+    if (!playerData) continue; // left during the hand
+    playerData.stack = player.stack; // carry the stack into the next hand
+
+    if (player.stack <= 0) {
+      playerData.status = 'busted';
+      playerData.ready = false;
+      holdEmBustedPlayers[roomId] = holdEmBustedPlayers[roomId] || new Set();
+      holdEmBustedPlayers[roomId].add(player.id);
+      playerData.socket.emit('youBusted', {
+        bustedAmount: game.startingStacks[player.id] || 0, // what they lost this hand
+        minRebuy: HOLDEM_BUY_IN.minBuyIn,
+        maxRebuy: HOLDEM_BUY_IN.maxBuyIn,
+        suggestedRebuy: HOLDEM_BUY_IN.suggestedBuyIn
+      });
+    }
+  }
+
+  // Everyone else folded: the winner may show or muck their cards
+  const winnerId = result.method === 'fold' ? result.winners[0] : null;
+  if (winnerId && data[winnerId]) {
+    game.showOffer = { playerId: winnerId };
+    data[winnerId].socket.emit('offerShowCards', { decisionSeconds: HOLDEM_SHOW_DECISION_TIME / 1000 });
+    scheduleNextHoldEmHand(roomId, HOLDEM_SHOW_DECISION_TIME); // no answer = muck
+  } else {
+    game.showOffer = null;
+    scheduleNextHoldEmHand(roomId, result.method === 'showdown' ? HOLDEM_SHOWDOWN_DELAY : HOLDEM_STEP_DELAY);
+  }
+}
+
+/** (Re)start the countdown to the next deal. */
+function scheduleNextHoldEmHand(roomId, delay) {
+  const game = holdEmGames[roomId];
+  if (!game) return;
+  clearTimeout(game.nextHandTimer);
+  game.nextHandTimer = setTimeout(() => {
+    game.nextHandTimer = null;
+    game.showOffer = null;
+    startNextHoldEmHand(roomId);
+  }, delay);
+}
+
+/**
+ * Deal a new hand to everyone who is ready and has chips. Current players keep
+ * their seats; newcomers, rebuys and rejoins are seated after them.
+ */
+function startNextHoldEmHand(roomId) {
+  const game = holdEmGames[roomId];
+  const data = holdEmPlayerData[roomId];
+  if (!game || !data || game.handInProgress) return;
+
+  const canPlay = id => {
+    const p = data[id];
+    return p && p.ready && p.status === 'active' && p.stack > 0;
+  };
+  const seatIds = game.players.map(p => p.id).filter(canPlay).slice(0, HOLDEM_MAX_SEATS);
+  for (const id of Object.keys(data)) {
+    if (seatIds.includes(id) || !canPlay(id)) continue;
+    if (seatIds.length < HOLDEM_MAX_SEATS) {
+      seatIds.push(id);
+      data[id].toldTableFull = false;
+    } else if (!data[id].toldTableFull) {
+      // Table is full: they stay bought in and get the next free seat
+      data[id].toldTableFull = true;
+      data[id].socket.emit('errorMessage',
+        `The table is full (${HOLDEM_MAX_SEATS} players). You'll be dealt in when a seat opens.`);
+    }
+  }
+
+  if (seatIds.length < 2) {
+    game.state = 'waiting';
+    if (game.handsPlayed > 0) {
+      io.to(roomId).emit('waitingForRebuys', {
+        activePlayers: seatIds.map(id => ({ id, name: data[id].name, stack: data[id].stack })),
+        bustOut: Array.from(holdEmBustedPlayers[roomId] || [])
+          .filter(id => data[id])
+          .map(id => ({ id, name: data[id].name }))
+      });
+    }
+    return;
+  }
+
+  const seatingChanged = game.players.map(p => p.id).join(',') !== seatIds.join(',');
+  game.players = seatIds.map(id => ({ id, name: data[id].name, stack: data[id].stack, currentBet: 0 }));
+  const result = texasHoldEmEngine.startNewHand(game);
+  const isFirstHand = !game.handsPlayed;
+  game.handsPlayed = (game.handsPlayed || 0) + 1;
+
+  const seats = game.players.map(p => ({ id: p.id, name: p.name, stack: p.stack }));
+  if (isFirstHand || seatingChanged) {
+    // (Re)draw the seats around the table
+    io.to(roomId).emit('gameStarted', {
+      players: seats,
+      blinds: { small: game.smallBlind, big: game.bigBlind },
+      dealerButton: game.dealerButton
+    });
+  }
+  if (!isFirstHand) {
+    io.to(roomId).emit('newHandStarted', { pot: game.pot, players: seats });
+  }
+
+  for (const player of game.players) {
+    const playerSocket = data[player.id]?.socket;
+    if (playerSocket) {
+      playerSocket.emit('dealCards', { holeCards: game.playerHands[player.id] });
+    }
+  }
+
+  broadcastHoldEmState(roomId, 'gameState');
+  if (result.autoAdvanceNeeded) runOutHoldEmBoard(roomId);
+}
+
+/** Give a busted/watching player a new stack; they're dealt in from the next hand. */
+function seatHoldEmPlayerForNextHand(roomId, socketId, amount) {
+  const playerData = holdEmPlayerData[roomId][socketId];
+  playerData.stack = amount;
+  playerData.status = 'active';
+  playerData.ready = true;
+  if (holdEmBustedPlayers[roomId]) holdEmBustedPlayers[roomId].delete(socketId);
+}
+
+/** If the game stopped for lack of players, start again now that someone is back. */
+function resumeHoldEmIfPaused(roomId) {
+  const game = holdEmGames[roomId];
+  if (game && game.handsPlayed > 0 && !game.handInProgress && !game.nextHandTimer) {
+    startNextHoldEmHand(roomId);
+  }
+}
 
 function advanceTurn(roomId, fromSocketId) {
   const activeIds = inGame[roomId] || [];

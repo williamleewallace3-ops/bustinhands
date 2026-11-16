@@ -4,7 +4,8 @@
   "description": "Chinese Poker: Multiplayer card game web app (Chinese Poker and Texas Hold'em)",
   "main": "server/index.js",
   "scripts": {
-    "start": "node server/index.js"
+    "start": "node server/index.js",
+    "test": "node test/texasHoldEmEngine.test.js"
   },
   "dependencies": {
     "express": "^4.18.2",
