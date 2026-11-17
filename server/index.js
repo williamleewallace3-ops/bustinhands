@@ -6,6 +6,7 @@ const path = require('path');
 const fs = require('fs');
 const { findBestHand, HAND_TYPE_RANK, rankValue, SUIT_RANK } = require('./utils');
 const texasHoldEmEngine = require('./texasHoldEmEngine');
+const sitAndGo = require('./sitAndGo');
 const firstPlayDone = {}; // roomId -> true/false
 const app = express();
 const server = http.createServer(app);
@@ -422,7 +423,7 @@ function startGame(roomId) {
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  socket.on('joinRoom', ({ playerName, roomId, gameType = 'chinesePoker' }) => {
+  socket.on('joinRoom', ({ playerName, roomId, gameType = 'chinesePoker', holdemMode = 'cash' }) => {
     socket.playerName = playerName;
     socket.roomId = roomId;
     socket.gameType = gameType;
@@ -508,7 +509,9 @@ io.on('connection', (socket) => {
     // Initialize Texas Hold 'Em state
     else if (gameType === 'texasHoldEm') {
       if (!holdEmGames[roomId]) {
-        holdEmGames[roomId] = texasHoldEmEngine.createGame(roomId, 0.05, 0.10);
+        holdEmGames[roomId] = holdemMode === 'sng'
+          ? createSitAndGoGame(roomId)
+          : texasHoldEmEngine.createGame(roomId, 0.05, 0.10);
       }
       if (!holdEmPlayerData[roomId]) {
         holdEmPlayerData[roomId] = {};
@@ -527,6 +530,12 @@ io.on('connection', (socket) => {
 
       console.log(`🤠 Player ${playerName} (${socket.id}) joined Texas Hold 'Em room ${roomId}`);
       
+      // The table decides the mode (each mode has its own room)
+      socket.emit('holdemMode', { mode: holdEmGames[roomId].sng ? 'sng' : 'cash' });
+
+      if (holdEmGames[roomId].sng) {
+        sngPlayerJoined(roomId, socket);
+      } else
       // Prompt for buy-in amount
       socket.emit('promptBuyIn', {
         minBuyIn: 1.00,
@@ -556,6 +565,7 @@ io.on('connection', (socket) => {
    * Handle Texas Hold 'Em buy-in submission
    */
   socket.on('submitBuyIn', ({ roomId, buyInAmount }) => {
+    if (holdEmGames[roomId]?.sng) return socket.emit('errorMessage', "That isn't available in a Sit 'N Go.");
     if (!holdEmPlayerData[roomId] || !holdEmPlayerData[roomId][socket.id]) {
       socket.emit('errorMessage', 'Invalid room or player data');
       return;
@@ -581,6 +591,21 @@ io.on('connection', (socket) => {
     broadcastHoldEmLobby(roomId);
   });
 
+  /** Sit 'N Go: the first player sets the buy-in (0 = just for fun). */
+  socket.on('sngSetBuyIn', ({ roomId, amount }) => {
+    const sng = holdEmGames[roomId]?.sng;
+    if (!sng || sng.status !== 'registering' || sng.buyIn !== null) return;
+    const buyIn = Math.round((parseFloat(amount) || 0) * 100) / 100;
+    if (buyIn < 0 || buyIn > 1000) {
+      socket.emit('errorMessage', 'Buy-in must be between $0 and $1000');
+      socket.emit('sngPromptBuyIn');
+      return;
+    }
+    sng.buyIn = buyIn;
+    broadcastSngLobby(roomId);
+    maybeStartSitAndGo(roomId);
+  });
+
   /**
    * Handle Texas Hold 'Em ready click
    */
@@ -591,6 +616,10 @@ io.on('connection', (socket) => {
     }
 
     const playerData = holdEmPlayerData[roomId][socket.id];
+    if (holdEmGames[roomId]?.sng) {
+      sngPlayerReady(roomId, socket);
+      return;
+    }
     if (!playerData.stack || playerData.stack <= 0) {
       socket.emit('errorMessage', 'Cannot ready up - no stack');
       return;
@@ -664,6 +693,7 @@ io.on('connection', (socket) => {
    * Handle blind change request (Texas Hold 'Em)
    */
   socket.on('requestBlindChange', ({ roomId, smallBlind, bigBlind }) => {
+    if (holdEmGames[roomId]?.sng) return socket.emit('errorMessage', "That isn't available in a Sit 'N Go.");
     const game = holdEmGames[roomId];
     if (!game) {
       socket.emit('errorMessage', 'Game not found');
@@ -721,6 +751,7 @@ io.on('connection', (socket) => {
    * Handle rebuy after busting out (Texas Hold 'Em)
    */
   socket.on('submitRebuy', ({ roomId, rebuyAmount }) => {
+    if (holdEmGames[roomId]?.sng) return socket.emit('errorMessage', "That isn't available in a Sit 'N Go.");
     if (!holdEmPlayerData[roomId] || !holdEmPlayerData[roomId][socket.id]) {
       socket.emit('errorMessage', 'Invalid room or player data');
       return;
@@ -751,6 +782,7 @@ io.on('connection', (socket) => {
    * Handle player choosing to watch instead of rebuy (Texas Hold 'Em)
    */
   socket.on('chooseToWatch', ({ roomId }) => {
+    if (holdEmGames[roomId]?.sng) return socket.emit('errorMessage', "That isn't available in a Sit 'N Go.");
     if (!holdEmPlayerData[roomId] || !holdEmPlayerData[roomId][socket.id]) {
       socket.emit('errorMessage', 'Invalid room or player data');
       return;
@@ -771,6 +803,7 @@ io.on('connection', (socket) => {
    * busted or watching; they're dealt in when the next hand starts.
    */
   socket.on('rejoinGame', ({ roomId, buyInAmount }) => {
+    if (holdEmGames[roomId]?.sng) return socket.emit('errorMessage', "That isn't available in a Sit 'N Go.");
     if (!holdEmPlayerData[roomId] || !holdEmPlayerData[roomId][socket.id]) {
       socket.emit('errorMessage', 'Invalid room or player data');
       return;
@@ -1270,6 +1303,7 @@ if (!firstPlayDone[roomId]) {
     }
     // Handle Texas Hold 'Em disconnection: the player folds and their chips stay in the pot
     else if (gameType === 'texasHoldEm' && holdEmPlayerData[roomId]) {
+      sngPlayerLeaving(roomId, socket.id);
       delete holdEmPlayerData[roomId][socket.id];
       if (holdEmBustedPlayers[roomId]) holdEmBustedPlayers[roomId].delete(socket.id);
       io.to(roomId).emit('playerDisconnected', { socketId: socket.id });
@@ -1277,6 +1311,7 @@ if (!firstPlayDone[roomId]) {
       const game = holdEmGames[roomId];
       if (game) {
         processHoldEmResult(roomId, texasHoldEmEngine.removePlayer(game, socket.id));
+        sngAfterPlayerLeft(roomId);
       }
 
       // Clean up room if empty
@@ -1284,6 +1319,7 @@ if (!firstPlayDone[roomId]) {
         if (game) {
           clearTimeout(game.runOutTimer);
           clearTimeout(game.nextHandTimer);
+          if (game.sng) clearTimeout(game.sng.levelTimer);
         }
         delete holdEmGames[roomId];
         delete holdEmPlayerData[roomId];
@@ -1425,6 +1461,7 @@ function finishHoldEmHand(roomId, result) {
   if (!game) return;
   clearTimeout(game.runOutTimer);
   writeHandHistory(roomId, game);
+  const sngOut = game.sng ? sngRecordKnockouts(roomId, game) : null;
 
   io.to(roomId).emit('handComplete', {
     winners: result.winners,
@@ -1435,7 +1472,8 @@ function finishHoldEmHand(roomId, result) {
     shownHands: result.shownHands || [], // showdown: everyone's cards face up
     sidePotDistribution: result.sidePotDistribution,
     winnings: result.winnings,
-    winnerSummary: result.winnerSummary || []
+    winnerSummary: result.winnerSummary || [],
+    eliminations: sngOut ? sngOut.eliminations : []  // Sit 'N Go: who finished where
   });
 
   for (const player of game.players) {
@@ -1443,7 +1481,7 @@ function finishHoldEmHand(roomId, result) {
     if (!playerData) continue; // left during the hand
     playerData.stack = player.stack; // carry the stack into the next hand
 
-    if (player.stack <= 0) {
+    if (player.stack <= 0 && !game.sng) {
       playerData.status = 'busted';
       playerData.ready = false;
       holdEmBustedPlayers[roomId] = holdEmBustedPlayers[roomId] || new Set();
@@ -1455,6 +1493,17 @@ function finishHoldEmHand(roomId, result) {
         suggestedRebuy: HOLDEM_BUY_IN.suggestedBuyIn
       });
     }
+  }
+
+  if (sngOut) {
+    for (const e of sngOut.eliminations) {
+      data[e.id]?.socket.emit('sngEliminated', { place: e.place, prize: e.prize });
+    }
+    if (sngOut.finished) {
+      finishSitAndGo(roomId, sngOut.winnerId, result.method === 'showdown' ? HOLDEM_SHOWDOWN_DELAY : HOLDEM_STEP_DELAY);
+      return;
+    }
+    broadcastSngClock(roomId);
   }
 
   // Everyone else folded: the winner may show or muck their cards
@@ -1489,6 +1538,8 @@ function startNextHoldEmHand(roomId) {
   const game = holdEmGames[roomId];
   const data = holdEmPlayerData[roomId];
   if (!game || !data || game.handInProgress) return;
+  if (game.sng && game.sng.status !== 'running') return;
+  if (game.sng) applySngBlindLevel(roomId);
 
   const canPlay = id => {
     const p = data[id];
@@ -1510,7 +1561,7 @@ function startNextHoldEmHand(roomId) {
 
   if (seatIds.length < 2) {
     game.state = 'waiting';
-    if (game.handsPlayed > 0) {
+    if (game.handsPlayed > 0 && !game.sng) {
       io.to(roomId).emit('waitingForRebuys', {
         activePlayers: seatIds.map(id => ({ id, name: data[id].name, stack: data[id].stack })),
         bustOut: Array.from(holdEmBustedPlayers[roomId] || [])
@@ -1548,6 +1599,7 @@ function startNextHoldEmHand(roomId) {
   }
 
   broadcastHoldEmState(roomId, 'gameState');
+  if (game.sng) broadcastSngClock(roomId);
   if (result.autoAdvanceNeeded) runOutHoldEmBoard(roomId);
 }
 
@@ -1571,21 +1623,301 @@ function localStamp(date = new Date()) {
 function appendHandLog(text) {
   if (HAND_LOG_TO_CONSOLE) console.log(text.trimEnd());
   const { day } = localStamp();
-  fs.mkdir(HAND_LOG_DIR, { recursive: true }, (dirErr) => {
-    if (dirErr) return console.error('Hand history: could not create logs folder', dirErr.message);
-    fs.appendFile(path.join(HAND_LOG_DIR, `holdem-hands-${day}.log`), text, (err) => {
-      if (err) console.error('Hand history: could not write', err.message);
-    });
-  });
+  // Written immediately (small appends) so entries stay in the order they happened
+  try {
+    fs.mkdirSync(HAND_LOG_DIR, { recursive: true });
+    fs.appendFileSync(path.join(HAND_LOG_DIR, `holdem-hands-${day}.log`), text);
+  } catch (err) {
+    console.error('Hand history: could not write', err.message);
+  }
 }
 
 function writeHandHistory(roomId, game) {
   if (!game.handLog || game.handLogWritten === game.handNumber) return;
   game.handLogWritten = game.handNumber;
   const { day, time } = localStamp();
-  const header = `===== Hand #${game.handNumber}  ${day} ${time}  (room ${roomId}) =====`;
+  const sngLevel = game.sng ? `, Sit 'N Go level ${game.sng.appliedLevel + 1}` : '';
+  const header = `===== Hand #${game.handNumber}  ${day} ${time}  (room ${roomId}${sngLevel}) =====`;
   appendHandLog([header, ...game.handLog, ''].join('\n') + '\n');
   if (!HAND_LOG_TO_CONSOLE) console.log(`📝 Hand #${game.handNumber} saved to hand history`);
+}
+
+/* ===============================
+   HOLD'EM SIT 'N GO
+   Its own room. Everyone starts with the same chips, blinds rise on a clock,
+   and players are knocked out until one is left. Rules: server/sitAndGo.js
+================================ */
+function createSitAndGoGame(roomId) {
+  const { smallBlind, bigBlind } = sitAndGo.blindsForLevel(0);
+  const game = texasHoldEmEngine.createGame(roomId, smallBlind, bigBlind);
+  game.chipMode = true;   // whole tournament chips, shown without $
+  game.unitCents = 100;
+  game.sng = sitAndGo.createTournament();
+  return game;
+}
+
+const sngRegistered = (roomId) => Object.entries(holdEmPlayerData[roomId] || {})
+  .filter(([, p]) => p.status === 'registered');
+
+const sngStillIn = (sng) => Object.keys(sng.entrants).filter(id => sng.entrants[id].place === null);
+
+/** A player arrives: register them, or let them watch if a tournament is running or full. */
+function sngPlayerJoined(roomId, socket) {
+  const game = holdEmGames[roomId];
+  const sng = game.sng;
+  const playerData = holdEmPlayerData[roomId][socket.id];
+  const full = sngRegistered(roomId).length >= sitAndGo.MAX_PLAYERS;
+  playerData.status = (sng.status === 'registering' && !full) ? 'registered' : 'spectator';
+  playerData.ready = false;
+
+  if (playerData.status === 'spectator') {
+    socket.emit('errorMessage', sng.status === 'running'
+      ? "A Sit 'N Go is in progress. You can watch, and you'll be entered in the next one."
+      : `This Sit 'N Go is full (${sitAndGo.MAX_PLAYERS} players). You'll be entered in the next one.`);
+  }
+  sngAskForBuyIn(roomId);
+  broadcastSngLobby(roomId);
+
+  // Watching a tournament in progress: draw the table as it is now
+  if (sng.status === 'running' && game.players.length) {
+    socket.emit('gameStarted', {
+      players: game.players.map(p => ({ id: p.id, name: p.name, stack: p.stack })),
+      blinds: { small: game.smallBlind, big: game.bigBlind },
+      dealerButton: game.dealerButton
+    });
+    socket.emit('gameState', holdEmStatePayload(game));
+    broadcastSngClock(roomId);
+  }
+}
+
+/** The first registered player is asked to set the buy-in (once per tournament). */
+function sngAskForBuyIn(roomId) {
+  const sng = holdEmGames[roomId]?.sng;
+  if (!sng || sng.status !== 'registering' || sng.buyIn !== null) return;
+  const data = holdEmPlayerData[roomId] || {};
+  if (sng.buyInSetterId && data[sng.buyInSetterId]) return; // already asked someone
+  const first = sngRegistered(roomId)[0];
+  if (!first) return;
+  sng.buyInSetterId = first[0];
+  first[1].socket.emit('sngPromptBuyIn');
+}
+
+function sngPlayerReady(roomId, socket) {
+  const playerData = holdEmPlayerData[roomId][socket.id];
+  if (playerData.status !== 'registered') {
+    socket.emit('errorMessage', "You'll be entered in the next Sit 'N Go.");
+    return;
+  }
+  playerData.ready = true;
+  broadcastSngLobby(roomId);
+  maybeStartSitAndGo(roomId);
+}
+
+/** Start once 2+ players are registered, all are ready, and the buy-in is set. */
+function maybeStartSitAndGo(roomId) {
+  const game = holdEmGames[roomId];
+  const sng = game?.sng;
+  if (!sng || sng.status !== 'registering' || sng.buyIn === null) return;
+  const registered = sngRegistered(roomId);
+  if (registered.length < 2 || !registered.every(([, p]) => p.ready)) return;
+
+  sng.status = 'running';
+  sng.entrants = {};
+  for (const [id, p] of registered) {
+    sng.entrants[id] = { name: p.name, place: null, prize: null };
+    p.status = 'active';
+    p.ready = true;
+    p.stack = sitAndGo.STARTING_STACK;
+  }
+  sng.startedAt = Date.now();
+  sng.appliedLevel = 0;
+  const { smallBlind, bigBlind } = sitAndGo.blindsForLevel(0);
+  game.smallBlind = smallBlind;
+  game.bigBlind = bigBlind;
+  game.handsPlayed = 0;
+  game.players = [];
+  game.dealerButton = -1;
+
+  const names = registered.map(([, p]) => p.name).join(', ');
+  appendHandLog(`##### Sit 'N Go started  ${new Date().toISOString()}  (room ${roomId}) #####\n` +
+    `Players: ${names}  |  Starting chips ${sitAndGo.STARTING_STACK}  |  Buy-in $${sng.buyIn.toFixed(2)}\n\n`);
+  io.to(roomId).emit('sngStarted', { players: registered.map(([, p]) => p.name) });
+  broadcastSngLobby(roomId);
+  scheduleSngLevelTimer(roomId);
+  startNextHoldEmHand(roomId);
+}
+
+/** At the start of each hand, use the blinds of the level the clock is on. */
+function applySngBlindLevel(roomId) {
+  const game = holdEmGames[roomId];
+  const sng = game.sng;
+  const level = sitAndGo.levelAt(Date.now() - sng.startedAt);
+  if (level <= sng.appliedLevel) return;
+  sng.appliedLevel = level;
+  const { smallBlind, bigBlind } = sitAndGo.blindsForLevel(level);
+  game.smallBlind = smallBlind;
+  game.bigBlind = bigBlind;
+  io.to(roomId).emit('sngLevelUp', { level: level + 1, smallBlind, bigBlind });
+}
+
+/** Tell everyone when each level's time is up (new blinds start with the next hand). */
+function scheduleSngLevelTimer(roomId) {
+  const sng = holdEmGames[roomId]?.sng;
+  if (!sng || sng.status !== 'running') return;
+  clearTimeout(sng.levelTimer);
+  const elapsed = Date.now() - sng.startedAt;
+  const nextBoundary = (sitAndGo.levelAt(elapsed) + 1) * sitAndGo.LEVEL_MS;
+  sng.levelTimer = setTimeout(() => {
+    broadcastSngClock(roomId);
+    scheduleSngLevelTimer(roomId);
+  }, nextBoundary - elapsed + 50);
+}
+
+function broadcastSngClock(roomId) {
+  const game = holdEmGames[roomId];
+  const sng = game?.sng;
+  if (!sng || sng.status !== 'running') return;
+  const elapsed = Date.now() - sng.startedAt;
+  const clockLevel = sitAndGo.levelAt(elapsed);
+  const pending = clockLevel > sng.appliedLevel; // time's up: new blinds next hand
+  const next = sitAndGo.blindsForLevel(pending ? clockLevel : sng.appliedLevel + 1);
+  const entrants = Object.keys(sng.entrants).length;
+  io.to(roomId).emit('sngClock', {
+    level: sng.appliedLevel + 1,
+    smallBlind: game.smallBlind,
+    bigBlind: game.bigBlind,
+    nextSmallBlind: next.smallBlind,
+    nextBigBlind: next.bigBlind,
+    msToNextLevel: pending ? 0 : (clockLevel + 1) * sitAndGo.LEVEL_MS - elapsed,
+    pending,
+    playersLeft: sngStillIn(sng).length,
+    entrants,
+    buyIn: sng.buyIn,
+    prizes: sitAndGo.prizes(sng.buyIn, entrants)
+  });
+}
+
+function broadcastSngLobby(roomId) {
+  const sng = holdEmGames[roomId]?.sng;
+  if (!sng) return;
+  const data = holdEmPlayerData[roomId] || {};
+  const registered = sngRegistered(roomId);
+  io.to(roomId).emit('sngLobby', {
+    status: sng.status,
+    buyIn: sng.buyIn,
+    buyInSetterName: data[sng.buyInSetterId]?.name || null,
+    players: registered.map(([id, p]) => ({ id, name: p.name, ready: !!p.ready })),
+    spectators: Object.values(data).filter(p => p.status === 'spectator').length,
+    startingStack: sitAndGo.STARTING_STACK,
+    levelMinutes: sitAndGo.LEVEL_MS / 60000,
+    maxPlayers: sitAndGo.MAX_PLAYERS,
+    payoutPercents: sitAndGo.payoutPercents(Math.max(registered.length, 2))
+  });
+}
+
+/** After a hand: give finishing places to everyone who just ran out of chips. */
+function sngRecordKnockouts(roomId, game) {
+  const sng = game.sng;
+  const data = holdEmPlayerData[roomId] || {};
+  const busted = game.players
+    .filter(p => p.stack <= 0 && sng.entrants[p.id] && sng.entrants[p.id].place === null)
+    .map(p => ({ id: p.id, startingStack: game.startingStacks[p.id] || 0 }));
+  const bustedIds = new Set(busted.map(b => b.id));
+  const stillIn = sngStillIn(sng).filter(id => !bustedIds.has(id));
+  const entrants = Object.keys(sng.entrants).length;
+  const prizeList = sitAndGo.prizes(sng.buyIn, entrants);
+
+  const placed = sitAndGo.placeEliminated(busted, stillIn.length)
+    .map(p => ({ ...p, startingStack: game.startingStacks[p.id] || 0 }));
+  const prizeFor = sitAndGo.knockoutPrizes(placed, prizeList); // ties share their prizes
+
+  const eliminations = placed.map(({ id, place }) => {
+    sng.entrants[id].place = place;
+    sng.entrants[id].prize = prizeFor[id] || 0;
+    if (data[id]) {
+      data[id].status = 'eliminated';
+      data[id].ready = false;
+      data[id].stack = 0;
+    }
+    const prize = sng.entrants[id].prize;
+    appendHandLog(`Sit 'N Go: ${sng.entrants[id].name} finished ${sitAndGo.ordinal(place)}` +
+      (prize ? ` ($${prize.toFixed(2)})` : '') + '\n\n');
+    return { id, name: sng.entrants[id].name, place, prize };
+  });
+  return { eliminations, finished: stillIn.length <= 1, winnerId: stillIn[0] || null };
+}
+
+/** A player leaves: mid-tournament they're out, in the worst place still open. */
+function sngPlayerLeaving(roomId, socketId) {
+  const sng = holdEmGames[roomId]?.sng;
+  if (!sng) return;
+  if (sng.buyInSetterId === socketId && sng.buyIn === null) sng.buyInSetterId = null;
+  const entrant = sng.status === 'running' && sng.entrants[socketId];
+  if (!entrant || entrant.place !== null) return;
+  entrant.place = sngStillIn(sng).length;
+  appendHandLog(`Sit 'N Go: ${entrant.name} left the table and finished ${sitAndGo.ordinal(entrant.place)}\n\n`);
+  io.to(roomId).emit('sngPlayerLeft', { name: entrant.name, place: entrant.place });
+}
+
+function sngAfterPlayerLeft(roomId) {
+  const game = holdEmGames[roomId];
+  const sng = game?.sng;
+  if (!sng) return;
+  if (sng.status === 'registering') {
+    sngAskForBuyIn(roomId);
+    broadcastSngLobby(roomId);
+    maybeStartSitAndGo(roomId);
+    return;
+  }
+  if (sng.status !== 'running') return;
+  const stillIn = sngStillIn(sng);
+  if (stillIn.length <= 1 && !game.handInProgress) {
+    clearTimeout(game.nextHandTimer);
+    game.nextHandTimer = null;
+    finishSitAndGo(roomId, stillIn[0] || null, 0);
+  } else {
+    broadcastSngClock(roomId);
+  }
+}
+
+/** One player left: crown the winner, show the standings, and open a new tournament. */
+function finishSitAndGo(roomId, winnerId, delay) {
+  const game = holdEmGames[roomId];
+  const sng = game.sng;
+  sng.status = 'finished';
+  clearTimeout(sng.levelTimer);
+  clearTimeout(game.nextHandTimer);
+  game.nextHandTimer = null;
+  if (winnerId && sng.entrants[winnerId]) sng.entrants[winnerId].place = 1;
+
+  const entrants = Object.keys(sng.entrants).length;
+  const prizeList = sitAndGo.prizes(sng.buyIn, entrants);
+  const standings = Object.entries(sng.entrants)
+    .map(([id, e]) => ({ id, name: e.name, place: e.place, prize: e.prize ?? (prizeList[(e.place || entrants) - 1] || 0) }))
+    .sort((a, b) => (a.place || 99) - (b.place || 99));
+  appendHandLog(`##### Sit 'N Go finished: ` +
+    standings.map(s => `${sitAndGo.ordinal(s.place)} ${s.name}${s.prize ? ` $${s.prize.toFixed(2)}` : ''}`).join(', ') +
+    ' #####\n\n');
+
+  setTimeout(() => {
+    if (holdEmGames[roomId] !== game) return; // room closed meanwhile
+    io.to(roomId).emit('sngFinished', { standings, buyIn: sng.buyIn, prizePool: (sng.buyIn || 0) * entrants });
+
+    // Open the next tournament: everyone still here is registered, same buy-in
+    const buyIn = sng.buyIn;
+    game.sng = sitAndGo.createTournament(buyIn);
+    game.state = 'waiting';
+    game.handsPlayed = 0;
+    const data = holdEmPlayerData[roomId] || {};
+    let count = 0;
+    for (const p of Object.values(data)) {
+      p.ready = false;
+      p.stack = 0;
+      p.status = count < sitAndGo.MAX_PLAYERS ? 'registered' : 'spectator';
+      if (p.status === 'registered') count++;
+    }
+    broadcastSngLobby(roomId);
+  }, delay);
 }
 
 /** Give a busted/watching player a new stack; they're dealt in from the next hand. */

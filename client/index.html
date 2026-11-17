@@ -23,6 +23,18 @@
                 <button id="texasHoldEmBtn" class="gameSelectBtn">🤠 Texas Hold 'Em</button>
             </div>
         </div>
+
+        <!-- TEXAS HOLD 'EM: CASH GAME OR SIT 'N GO (hidden initially) -->
+        <div id="holdemModeOverlay" style="display:none;">
+            <div id="holdemModeContainer">
+                <h2>Texas Hold 'Em</h2>
+                <button id="cashGameBtn" class="gameSelectBtn">💵 Cash Game
+                    <span class="modeHint">Buy in with dollars, re-buy any time</span></button>
+                <button id="sitAndGoBtn" class="gameSelectBtn">🏆 Sit 'N Go
+                    <span class="modeHint">1,500 chips each, blinds rise every 4 min, last one standing wins</span></button>
+                <button id="holdemModeBackBtn">Back</button>
+            </div>
+        </div>
         
         <!-- SCENE SELECTION SCREEN (hidden initially) -->
         <div id="sceneOverlay" style="display:none;">
@@ -162,6 +174,7 @@
     <script src="texasHoldEm.js"></script>
     <script src="holdemTableFx.js"></script>
     <script src="app.js"></script>
+    <script src="holdemSitAndGo.js"></script>
     <script src="enhancements.js"></script>
 </body>
 </html>

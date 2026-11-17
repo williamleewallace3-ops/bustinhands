@@ -36,7 +36,7 @@ function initializeTexasHoldEmUI() {
   potArea.className = 'pot-display';
   potArea.innerHTML = `
     <div class="pot-label">Pot</div>
-    <div id="potAmount" class="pot-amount">$0.00</div>
+    <div id="potAmount" class="pot-amount">${fmtChips(0)}</div>
   `;
   topSection.appendChild(potArea);
   
@@ -132,6 +132,33 @@ function initializeTexasHoldEmUI() {
 }
 
 /* ===============================
+   MONEY OR TOURNAMENT CHIPS
+================================ */
+// Cash game: dollars and cents. Sit 'N Go: whole tournament chips, no $.
+window.holdemChipMode = false;
+
+function setHoldemChipMode(on) {
+  window.holdemChipMode = !!on;
+  const input = document.getElementById('customBetAmount');
+  if (input) input.step = on ? '1' : '0.01';
+}
+
+/** "$1.50" in a cash game, "1,500" in a Sit 'N Go */
+function fmtChips(x) {
+  const n = Number(x) || 0;
+  return window.holdemChipMode
+    ? Math.round(n).toLocaleString('en-US')
+    : `$${n.toFixed(2)}`;
+}
+
+/** 1 -> "1st", 2 -> "2nd" ... */
+function ordinal(n) {
+  const mod100 = n % 100;
+  if (mod100 >= 11 && mod100 <= 13) return `${n}th`;
+  return `${n}${{ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th'}`;
+}
+
+/* ===============================
    RE-BUY (after busting / while watching)
 ================================ */
 const REBUY_LIMITS = { min: 1.00, max: 1000.00, suggested: 10.00 };
@@ -184,7 +211,7 @@ function displayCommunityCards(cards) {
 function updatePotDisplay(potAmount) {
   const potDisplay = document.getElementById('potAmount');
   if (potDisplay) {
-    potDisplay.textContent = '$' + potAmount.toFixed(2);
+    potDisplay.textContent = fmtChips(potAmount);
   }
 }
 
@@ -226,7 +253,7 @@ function displayPlayerAtSeat(seatNumber, playerInfo, totalPlayers = 2, allPlayer
         <span class="player-name">${playerInfo.name}</span>
         <span class="seat-badges"></span>
       </div>
-      <div class="player-stack">$${playerInfo.stack.toFixed(2)}</div>
+      <div class="player-stack">${fmtChips(playerInfo.stack)}</div>
       <div class="player-last-action" style="visibility:hidden;">&nbsp;</div>
       <div class="player-to-call" style="visibility:hidden;">&nbsp;</div>
       ${tableCardsHTML}
@@ -576,8 +603,8 @@ function showBettingControls(gameState) {
     callBtn.style.display = 'inline-block';
     const callAmount = Math.min(amountToCall, playerStack);
     callBtn.textContent = callAmount < amountToCall
-      ? `Call All-In $${callAmount.toFixed(2)}`
-      : `Call $${callAmount.toFixed(2)}`;
+      ? `Call All-In ${fmtChips(callAmount)}`
+      : `Call ${fmtChips(callAmount)}`;
     callBtn.dataset.amount = callAmount.toFixed(2);
     // Can only raise if the player has more than enough to call
     if (playerStack > amountToCall) {
@@ -588,6 +615,7 @@ function showBettingControls(gameState) {
 
 /** Round to whole cents */
 function toMoney(x) {
+  if (window.holdemChipMode) return Math.round(Number(x) || 0); // whole tournament chips
   return Math.round((Number(x) || 0) * 100) / 100;
 }
 
@@ -630,7 +658,7 @@ function showBetSizingOptions(gameState, betType) {
     // Hide sizes below the minimum, or that would be all-in anyway (All-In button covers that)
     if (amount >= minBet && amount < maxBet && amount > 0) {
       btn.style.display = 'inline-block';
-      btn.textContent = `${label} ($${amount.toFixed(2)})`;
+      btn.textContent = `${label} (${fmtChips(amount)})`;
       btn.dataset.amount = amount.toFixed(2);
     } else {
       btn.style.display = 'none';
@@ -649,7 +677,7 @@ function showBetSizingOptions(gameState, betType) {
   if (betAllInBtn) {
     if (maxBet > highestBet) {
       betAllInBtn.style.display = 'inline-block';
-      betAllInBtn.textContent = `All-In ($${maxBet.toFixed(2)})`;
+      betAllInBtn.textContent = `All-In (${fmtChips(maxBet)})`;
       betAllInBtn.dataset.amount = maxBet.toFixed(2);
     } else {
       betAllInBtn.style.display = 'none';
@@ -664,7 +692,7 @@ function showBetSizingOptions(gameState, betType) {
     customBetBtn.textContent = verb === 'Bet' ? 'Bet' : 'Raise';
     customBetAmount.style.display = 'inline-block';
     customBetAmount.value = '';
-    customBetAmount.placeholder = `$${minBet.toFixed(2)} - $${maxBet.toFixed(2)}`;
+    customBetAmount.placeholder = `${fmtChips(minBet)} - ${fmtChips(maxBet)}`;
   }
 
   // Show bet options container
@@ -703,7 +731,7 @@ function updateCurrentBettor(playerId) {
  */
 function updateSeatStatus(seatDiv, player, table) {
   if (!seatDiv || !player) return;
-  const money = (x) => `$${Number(x).toFixed(2)}`;
+  const money = fmtChips;
   const bettingOpen = ['preflop', 'flop', 'turn', 'river'].includes(table.state) && !!table.currentBettor;
 
   seatDiv.classList.toggle('folded', !!player.folded);
@@ -856,13 +884,13 @@ function attachTexasHoldEmListeners() {
     }
 
     if (amount < minBet && amount < maxBet) {
-      alert(`Minimum is $${minBet.toFixed(2)}`);
+      alert(`Minimum is ${fmtChips(minBet)}`);
       customInput.focus();
       return;
     }
 
     if (amount > maxBet) {
-      alert(`Maximum (all-in) is $${maxBet.toFixed(2)}`);
+      alert(`Maximum (all-in) is ${fmtChips(maxBet)}`);
       customInput.focus();
       return;
     }
@@ -1535,6 +1563,7 @@ function addTexasHoldEmStyles() {
     }
 
     .game-message {
+      white-space: pre-line;  /* one line per winner / knockout */
       position: fixed;
       top: 50%;
       left: 50%;

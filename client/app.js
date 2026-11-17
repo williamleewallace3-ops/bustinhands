@@ -17,7 +17,9 @@ socket.on('connect', () => {
   // If we have joined a room before and the game is active, rejoin on reconnect
   if (roomId && playerName && gameDiv.style.display === 'block') {
     console.log('🔄 Rejoining room after reconnect:', roomId);
-    socket.emit('joinRoom', { playerName, roomId });
+    // Same game as before (without gameType the server assumed Chinese Poker)
+    socket.emit('joinRoom', { playerName, roomId, gameType: selectedGame,
+      holdemMode: window.holdemChipMode ? 'sng' : 'cash' });
   }
 });
 
@@ -428,6 +430,7 @@ let placeholder = null;
 let selectedScene = 'vampire-bar'; // default scene
 let selectedDeck = '1'; // default deck
 let selectedGame = 'chinesePoker'; // default game ('chinesePoker' or 'texasHoldEm')
+let holdemMode = 'cash'; // Texas Hold 'Em: 'cash' or 'sng' (Sit 'N Go)
 let isMyTurn = false;
 let currentTrickCardCount = null;
 let hasPowerLead = false;
@@ -544,7 +547,26 @@ chinesePokerBtn.addEventListener('click', () => {
 
 texasHoldEmBtn.addEventListener('click', () => {
     selectedGame = 'texasHoldEm';
+    // Next: Cash Game or Sit 'N Go
+    document.getElementById('gameSelectOverlay').style.display = 'none';
+    document.getElementById('holdemModeOverlay').style.display = 'flex';
+});
+
+document.getElementById('cashGameBtn').addEventListener('click', () => {
+    holdemMode = 'cash';
+    document.getElementById('holdemModeOverlay').style.display = 'none';
     showSceneSelection();
+});
+
+document.getElementById('sitAndGoBtn').addEventListener('click', () => {
+    holdemMode = 'sng';
+    document.getElementById('holdemModeOverlay').style.display = 'none';
+    showSceneSelection();
+});
+
+document.getElementById('holdemModeBackBtn').addEventListener('click', () => {
+    document.getElementById('holdemModeOverlay').style.display = 'none';
+    document.getElementById('gameSelectOverlay').style.display = 'flex';
 });
 
 function showSceneSelection() {
@@ -603,10 +625,14 @@ deckButtons.forEach(btn => {
 });
 
 function startGame(scene) {
-    const defaultRoomId = 'mainRoom';
+    // A Sit 'N Go has its own room, so it never mixes with the cash game
+    const isSitAndGo = selectedGame === 'texasHoldEm' && holdemMode === 'sng';
+    const defaultRoomId = isSitAndGo ? 'sitAndGoRoom' : 'mainRoom';
     roomId = defaultRoomId;
+    setHoldemChipMode(isSitAndGo);
     
-    socket.emit('joinRoom', { playerName, roomId: defaultRoomId, gameType: selectedGame });
+    socket.emit('joinRoom', { playerName, roomId: defaultRoomId, gameType: selectedGame,
+      holdemMode: isSitAndGo ? 'sng' : 'cash' });
 
     applyScene(scene);
     initializeInGameOptions();
@@ -614,12 +640,13 @@ function startGame(scene) {
     // Hide lobby and show game
     document.getElementById('lobby').style.display = 'none';
     gameDiv.style.display = 'block';
-    if (roomLabel) roomLabel.textContent = 'Main Game';
+    if (roomLabel) roomLabel.textContent = isSitAndGo ? "Sit 'N Go" : 'Main Game';
     updateInGameHeaderVisibility();
     
     // Initialize game-specific UI
     // (the texas-holdem class hides the Chinese Poker chat and player panels)
     document.body.classList.toggle('texas-holdem', selectedGame === 'texasHoldEm');
+    document.body.classList.toggle('holdem-sng', isSitAndGo);
     if (selectedGame === 'texasHoldEm') {
       initializeTexasHoldEmUI();
     }
@@ -1485,6 +1512,12 @@ socket.on('disconnect', () => {
    TEXAS HOLD 'EM SOCKET EVENTS
 ================================ */
 
+socket.on('holdemMode', ({ mode }) => {
+  if (selectedGame !== 'texasHoldEm') return;
+  setHoldemChipMode(mode === 'sng');
+  document.body.classList.toggle('holdem-sng', mode === 'sng');
+});
+
 socket.on('promptBuyIn', ({ minBuyIn, maxBuyIn, suggestedBuyIn }) => {
   if (selectedGame !== 'texasHoldEm') return;
   
@@ -1669,7 +1702,7 @@ socket.on('gameStateUpdated', ({ state, pot, communityCards, currentBettor, high
   }
 });
 
-socket.on('handComplete', ({ winners, winnerNames, pot, method, allHands, shownHands, sidePotDistribution, winnings, winnerSummary }) => {
+socket.on('handComplete', ({ winners, winnerNames, pot, method, allHands, shownHands, sidePotDistribution, winnings, winnerSummary, eliminations }) => {
   if (selectedGame !== 'texasHoldEm') return;
 
   console.log('🏆 Hand complete!');
@@ -1684,7 +1717,8 @@ socket.on('handComplete', ({ winners, winnerNames, pot, method, allHands, shownH
 
   // e.g. "T1 wins $1.50 with King high straight" (one line per winner)
   const message = (winnerSummary || [])
-    .map(w => `${w.name} wins $${w.amount.toFixed(2)}${w.hand ? ` with ${w.hand}` : ''}`)
+    .map(w => `${w.name} wins ${fmtChips(w.amount)}${w.hand ? ` with ${w.hand}` : ''}`)
+    .concat((eliminations || []).map(e => `${e.name} is out in ${ordinal(e.place)} place`))
     .join('\n');
   
   // Keep the showdown result up as long as the cards are shown
@@ -1751,7 +1785,7 @@ socket.on('newHandStarted', ({ pot, players }) => {
     if (seatDiv) {
       seatDiv.classList.remove('folded', 'all-in');
       const stackDiv = seatDiv.querySelector('.player-stack');
-      if (stackDiv) stackDiv.textContent = `$${player.stack.toFixed(2)}`;
+      if (stackDiv) stackDiv.textContent = fmtChips(player.stack);
       
       // Show table cards at the start of new hand
       if (typeof showTableCards === 'function') {

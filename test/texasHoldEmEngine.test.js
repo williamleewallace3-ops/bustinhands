@@ -444,6 +444,150 @@ test('hand history: each hand starts a fresh log with the next number', () => {
   assert.ok(!g.handLog.some(l => /everyone else folded/.test(l)));
 });
 
+/* ---------- Sit 'N Go ---------- */
+const SNGR = require('../server/sitAndGo');
+
+test("sng: blind schedule starts at 25/50 and keeps rising", () => {
+  assert.deepEqual(SNGR.blindsForLevel(0), { smallBlind: 25, bigBlind: 50 });
+  assert.deepEqual(SNGR.blindsForLevel(6), { smallBlind: 300, bigBlind: 600 });
+  const last = SNGR.BLIND_LEVELS.length - 1;
+  const beyond = SNGR.blindsForLevel(last + 1);
+  assert.equal(beyond.bigBlind, SNGR.blindsForLevel(last).bigBlind * 2);
+  for (let l = 1; l < 25; l++) {
+    assert.ok(SNGR.blindsForLevel(l).bigBlind > SNGR.blindsForLevel(l - 1).bigBlind);
+  }
+});
+
+test('sng: level clock', () => {
+  const m = 4 * 60 * 1000;
+  assert.equal(SNGR.levelAt(0, m), 0);
+  assert.equal(SNGR.levelAt(m - 1, m), 0);
+  assert.equal(SNGR.levelAt(m, m), 1);
+  assert.equal(SNGR.levelAt(25 * 60 * 1000, m), 6);
+});
+
+test('sng: payouts by table size, whole cents, nothing lost', () => {
+  assert.deepEqual(SNGR.prizes(10, 3), [30]);
+  assert.deepEqual(SNGR.prizes(10, 6), [39, 21]);
+  assert.deepEqual(SNGR.prizes(10, 9), [45, 27, 18]);
+  assert.deepEqual(SNGR.prizes(0, 6), [0, 0]);
+  for (const buyIn of [0.33, 1, 7.77, 25]) {
+    for (let n = 2; n <= 9; n++) {
+      const p = SNGR.prizes(buyIn, n);
+      assert.equal(p.reduce((a, b) => a + Math.round(b * 100), 0), Math.round(buyIn * 100) * n);
+    }
+  }
+});
+
+test('sng: players knocked out in the same hand are placed by starting stack', () => {
+  const places = SNGR.placeEliminated(
+    [{ id: 'small', startingStack: 200 }, { id: 'big', startingStack: 900 }], 3);
+  assert.deepEqual(places, [{ id: 'big', place: 4 }, { id: 'small', place: 5 }]);
+  assert.equal(SNGR.ordinal(1), '1st');
+  assert.equal(SNGR.ordinal(2), '2nd');
+  assert.equal(SNGR.ordinal(3), '3rd');
+  assert.equal(SNGR.ordinal(11), '11th');
+  assert.equal(SNGR.ordinal(22), '22nd');
+});
+
+test('sng: players who tie in a knockout share the prizes of their places', () => {
+  const prizeList = SNGR.prizes(10, 7); // [35, 21, 14]
+  const placed = [
+    { id: 'A', place: 2, startingStack: 800 },
+    { id: 'B', place: 3, startingStack: 800 },
+    { id: 'C', place: 4, startingStack: 300 }
+  ];
+  const p = SNGR.knockoutPrizes(placed, prizeList);
+  assert.equal(p.A, 17.5);
+  assert.equal(p.B, 17.5);
+  assert.equal(p.C, 0);
+  // Different starting stacks: no sharing
+  const q = SNGR.knockoutPrizes([{ id: 'A', place: 2, startingStack: 900 }, { id: 'B', place: 3, startingStack: 800 }], prizeList);
+  assert.deepEqual(q, { A: 21, B: 14 });
+  // Odd cent goes to the higher place
+  const r = SNGR.knockoutPrizes([{ id: 'A', place: 1, startingStack: 5 }, { id: 'B', place: 2, startingStack: 5 }], [0.03, 0]);
+  assert.equal(r.A + r.B, 0.03);
+});
+
+function chipGame(stacks, blinds = [25, 50]) {
+  const g = E.createGame('t', blinds[0], blinds[1]);
+  g.chipMode = true;
+  g.unitCents = 100;
+  g.players = stacks.map((s, i) => ({ id: 'P' + i, name: 'P' + i, stack: s, currentBet: 0 }));
+  return g;
+}
+
+test('sng: split pots pay whole chips only', () => {
+  const g = chipGame([0, 0]);
+  g.playerContributions = { P0: 75, P1: 76 };
+  g.pot = 151; g.handInProgress = true; g.dealerButton = 0;
+  g.foldedPlayers = new Set();
+  g.communityCards = cards('AS KS QS JS 10S');
+  g.playerHands = { P0: cards('2C 3D'), P1: cards('4C 5D') };
+  const res = E.determineWinner(g);
+  for (const w of Object.values(res.winnings)) assert.equal(w, Math.round(w));
+  assert.equal(res.winnings.P0 + res.winnings.P1, 151);
+});
+
+test('sng: bets round to whole chips and text has no $', () => {
+  const g = chipGame([1500, 1500, 1500]);
+  E.startNewHand(g);
+  const r = E.handlePlayerAction(g, g.currentBettor, 'raise', 150.4);
+  assert.ok(!r.error, r.error);
+  assert.equal(g.highestBet, 150);
+  const log = g.handLog.join('\n');
+  assert.ok(!log.includes('$'), log);
+  assert.match(log, /Raise to 150/);
+});
+
+test('sng: random tournaments end with one player holding every chip', () => {
+  let seed = 7;
+  const rand = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+  for (let t = 0; t < 40; t++) {
+    const n = 2 + (t % 8);
+    let stacks = Array(n).fill(SNGR.STARTING_STACK);
+    const ids = stacks.map((_, i) => 'P' + i);
+    const total = n * SNGR.STARTING_STACK;
+    const places = {};
+    let alive = ids.slice();
+    let dealer = -1;
+    for (let hand = 0; alive.length > 1; hand++) {
+      assert.ok(hand < 5000, 'tournament never ended');
+      const level = Math.floor(hand / 8);
+      const { smallBlind, bigBlind } = SNGR.blindsForLevel(level);
+      const g = chipGame([], [smallBlind, bigBlind]);
+      g.players = alive.map(id => ({ id, name: id, stack: stacks[ids.indexOf(id)], currentBet: 0 }));
+      g.dealerButton = dealer;
+      // Blinds alone can put everyone all-in, so the start can need a run-out
+      let res = E.startNewHand(g);
+      dealer = g.dealerButton;
+      let guard = 0;
+      while (g.handInProgress && !res.autoAdvanceNeeded) {
+        assert.ok(guard++ < 300, 'hand never ended');
+        const p = g.players.find(x => x.id === g.currentBettor);
+        const toCall = g.highestBet - p.currentBet;
+        const r = rand();
+        if (r < 0.2 && toCall > 0) res = act(g, 'fold');
+        else if (r < 0.65) res = act(g, toCall > 0 ? 'call' : 'check');
+        else res = act(g, 'raise', r < 0.85 ? E.getMinRaiseTo(g) : p.stack + p.currentBet);
+        assert.ok(!res.error, res.error);
+      }
+      if (res.autoAdvanceNeeded) runOut(g);
+      for (const p of g.players) {
+        assert.equal(p.stack, Math.round(p.stack), 'fractional chips');
+        stacks[ids.indexOf(p.id)] = p.stack;
+      }
+      assert.equal(stacks.reduce((a, b) => a + b, 0), total, 'chips created or lost');
+      const busted = g.players.filter(p => p.stack === 0)
+        .map(p => ({ id: p.id, startingStack: g.startingStacks[p.id] }));
+      alive = alive.filter(id => stacks[ids.indexOf(id)] > 0);
+      for (const { id, place } of SNGR.placeEliminated(busted, alive.length)) places[id] = place;
+    }
+    places[alive[0]] = 1;
+    assert.deepEqual(Object.values(places).sort((a, b) => a - b), ids.map((_, i) => i + 1));
+  }
+});
+
 console.log = realLog;
 for (const f of failures) console.log(`FAIL  ${f.name}\n      ${f.err.message}`);
 console.log(`\n${passed} passed, ${failures.length} failed`);

@@ -25,6 +25,8 @@ const SLIDE_MS = 600;
 /* ---------- chip drawing ---------- */
 // Denominations (dollars) and their chip colours
 const CHIP_DENOMS = [
+  { value: 1000, color: '#f9a825', edge: '#222' },   // Sit 'N Go sizes
+  { value: 500, color: '#6a1b9a', edge: '#ffd700' },
   { value: 100, color: '#222', edge: '#ffd700' },
   { value: 25, color: '#1b8a3a', edge: '#fff' },
   { value: 5, color: '#c62828', edge: '#fff' },
@@ -77,7 +79,7 @@ function buildChipPile(amount) {
   }
   const label = document.createElement('div');
   label.className = 'fx-chip-label';
-  label.textContent = `$${amount.toFixed(2)}`;
+  label.textContent = fmtChips(amount);
   el.appendChild(columns);
   el.appendChild(label);
   return el;
